@@ -54,6 +54,10 @@ func main() {
 	config := parseFlags()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go func() {
+		<-ctx.Done()
+		log.Printf("shutdown requested, draining services")
+	}()
 
 	if config.SetupMode {
 		settings, err := setup.Run(ctx)
@@ -399,10 +403,19 @@ func runTLSWithContext(ctx context.Context, server *http.Server) error {
 	shutdownErr := make(chan error, 1)
 	go func() {
 		<-ctx.Done()
-		shutdownErr <- server.Shutdown(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err := server.Shutdown(shutdownCtx)
+		if err != nil {
+			_ = server.Close()
+		}
+		shutdownErr <- err
 	}()
 	if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
 		return err
 	}
-	return <-shutdownErr
+	if err := <-shutdownErr; err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return nil
 }

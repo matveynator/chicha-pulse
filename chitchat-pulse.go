@@ -142,7 +142,7 @@ func printHelp() {
 	reset := "\033[0m"
 
 	fmt.Fprintf(os.Stderr, "%schicha-pulse%s\n", green, reset)
-	fmt.Fprintf(os.Stderr, "%sUsage:%s chicha-pulse.go [flags]\n\n", yellow, reset)
+	fmt.Fprintf(os.Stderr, "%sUsage:%s chitchat-pulse.go [flags]\n\n", yellow, reset)
 
 	fmt.Fprintf(os.Stderr, "%s1) General settings & setup%s\n", cyan, reset)
 	fmt.Fprintln(os.Stderr, "  -setup                 Run interactive setup wizard")

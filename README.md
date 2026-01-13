@@ -1,68 +1,80 @@
 # chicha-pulse
 
-**Infrastructure health & control platform**
+**Infrastructure health & understanding platform**
 
-chicha-pulse is a **single-binary platform** for monitoring, inventory, and lifecycle management of Linux infrastructure.  
-It provides real-time visibility and control over **Linux servers, virtual machines, and clusters** — all from one tool.
+chicha-pulse is a **single-binary platform** for monitoring and inventory of infrastructure.
 
-With chicha-pulse, you can monitor system health, track infrastructure inventory, create and migrate virtual machines, and operate clusters through a unified control plane.
+Its primary goal is to **understand what each system does**:
+- what roles it performs
+- which services are running
+- what starts automatically
+- how it participates in the network
 
-No agents zoo.  
-No external dependencies.  
-One binary. One pulse.
+---
+
+## What chicha-pulse observes
+
+chicha-pulse treats all Unix-like systems as **peers**, without hard boundaries.
+
+A system may act as:
+- an application server
+- a router or gateway
+- a service node
+- a mixed-role system
+
+Roles are **not predefined** and can be **multiple at the same time**.
+
+chicha-pulse observes:
+- running processes
+- enabled and auto-start services
+- network interfaces and routes
+- exposed and consumed services
+
+Windows systems are supported for **inventory and monitoring only**.
+
+---
+
+## Health & Visibility
+
+chicha-pulse provides:
+- **service health checks and notifications**, inspired by Nagios
+- **load and resource visualization**, inspired by Grafana
+- historical view of system state and changes over time
+
+Alerts focus on **service impact**, not raw metrics.
 
 ---
 
 ## Core Idea
 
-chicha-pulse does **not lock you into its control plane**.
+You manage systems **directly**, using native tools.
 
-You can manage your infrastructure in **two ways**:
-- through **chicha-pulse**
-- or **directly**, using native Linux tools, hypervisors, and workflows
-
-chicha-pulse continuously observes the system state, **detects external changes**, and automatically **integrates them back into its inventory and control model**.
+chicha-pulse only **observes and understands** the real system state  
+and keeps its internal model in sync as things change.
 
 No forced workflows.  
-No abstraction prison.  
-Your infrastructure stays yours.
+No hidden control.  
+One binary. One pulse.
 
 ---
 
-## Key Features
+## Capabilities
 
-- **Single static binary**
-- **Linux-first**
-- Infrastructure health monitoring
-- Server and VM inventory
-- Virtual machine lifecycle management
-- Live VM migration
-- External state discovery and reconciliation
-- Unified control plane (CLI + API)
-- Embedded storage and web UI
-
----
-
-## Philosophy
-
-chicha-pulse is designed to be:
-- simple to deploy
-- safe to operate
-- transparent to infrastructure changes
-
-You are free to:
-- create or modify VMs manually
-- change system configuration directly
-- migrate workloads outside of chicha-pulse
-
-chicha-pulse will detect, understand, and reflect those changes — without breaking state or forcing rewrites.
+- System health monitoring
+- Service checks and notifications
+- Load and resource visualization
+- Inventory of hosts and services
+- Startup and service discovery
+- Multi-role detection
+- Network and routing awareness
+- Change tracking over time
 
 ---
 
-## Usage
+## Status
 
-```bash
-chicha-pulse run
-chicha-pulse agent
-chicha-pulse vm create
-chicha-pulse migrate vm01 node02
+Early stage. Focused on correctness and simplicity.
+
+---
+
+Monitor, understand, and observe your infrastructure — **in one pulse**.

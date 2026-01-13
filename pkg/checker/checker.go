@@ -52,14 +52,19 @@ type Result struct {
 // ---- Logging helpers ----
 
 const (
-	colorReset  = "\033[0m"
-	colorBlue   = "\033[34m"
-	colorCyan   = "\033[36m"
-	colorGreen  = "\033[32m"
-	colorYellow = "\033[33m"
-	colorRed    = "\033[31m"
-	colorPurple = "\033[35m"
-	colorGray   = "\033[90m"
+	colorReset        = "\033[0m"
+	colorBlue         = "\033[34m"
+	colorCyan         = "\033[36m"
+	colorGreen        = "\033[32m"
+	colorYellow       = "\033[33m"
+	colorRed          = "\033[31m"
+	colorPurple       = "\033[35m"
+	colorGray         = "\033[90m"
+	colorLightBlue    = "\033[94m"
+	colorLightCyan    = "\033[96m"
+	colorLightMagenta = "\033[95m"
+	colorLightGreen   = "\033[92m"
+	colorLightYellow  = "\033[93m"
 )
 
 func logSession(sessionID uint64, format string, args ...any) {
@@ -99,6 +104,29 @@ var statusWordPattern = regexp.MustCompile(`\b(ok|warning|critical|unknown)\b`)
 var errorWordPattern = regexp.MustCompile(`\b(error|failed)\b`)
 var errorFieldPattern = regexp.MustCompile(`\b(err|error)=("[^"]*"|\S+)`)
 
+type sessionAuthState int
+
+const (
+	sessionAuthUnknown sessionAuthState = iota
+	sessionAuthInProgress
+	sessionAuthReady
+)
+
+type sessionAuthReply struct {
+	State  sessionAuthState
+	Leader bool
+	Info   sshConfigResult
+	Err    error
+}
+
+type sessionAuthRequest struct {
+	SessionID uint64
+	Reply     chan sessionAuthReply
+	Update    *sessionAuthReply
+}
+
+var sessionAuthCh = make(chan sessionAuthRequest)
+
 func sessionLogColor(sessionID uint64) string {
 	// Keep session colors consistent so related lines are easy to scan.
 	reply := make(chan string, 1)
@@ -128,9 +156,9 @@ func statusWordColor(word string) string {
 	// Map status words to the palette so logs align with UI color conventions.
 	switch strings.ToLower(word) {
 	case "ok":
-		return colorGreen
+		return colorLightGreen
 	case "warning":
-		return colorYellow
+		return colorLightYellow
 	case "critical":
 		return colorRed
 	case "unknown":
@@ -432,6 +460,13 @@ func runSSHCheck(ctx context.Context, job Job, result Result) Result {
 	}
 	remoteCommand = expandCommand(remoteCommand, job)
 
+	config, err := ensureSessionSSHAuth(ctx, job)
+	if err != nil {
+		result.Status = 2
+		result.Output = err.Error()
+		return result
+	}
+
 	if !job.HostReachable {
 		if err := preflightTCP(ctx, address, port, "ssh", job.SessionID); err != nil {
 			result.Status = 2
@@ -449,13 +484,6 @@ func runSSHCheck(ctx context.Context, job Job, result Result) Result {
 		return result
 	}
 
-	config, err := sshConfig(ctx, job)
-	if err != nil {
-		result.Status = 2
-		result.Output = err.Error()
-		logSessionError(job.SessionID, "stage=SSH host=%s service=%s seq=%d result=auth-failed address=%s port=%d err=%q", job.HostName, job.ServiceName, job.Sequence, address, port, result.Output)
-		return result
-	}
 	logSessionInfo(job.SessionID, "stage=SSH host=%s service=%s seq=%d auth=user:%s keys=%s", job.HostName, job.ServiceName, job.Sequence, config.client.User, strings.Join(config.authSources, ","))
 	client, err := ssh.Dial("tcp", net.JoinHostPort(address, fmt.Sprintf("%d", port)), config.client)
 	if err != nil {
@@ -503,6 +531,17 @@ func runLegacySSHCheck(ctx context.Context, job Job, result Result, command stri
 	}
 	remoteCommand = expandCommand(remoteCommand, job)
 	user, host := parseTargetUserHost(target)
+
+	config, err := ensureSessionSSHAuth(ctx, job)
+	if err != nil {
+		result.Status = 2
+		result.Output = err.Error()
+		return result
+	}
+	if strings.TrimSpace(user) != "" {
+		config.client.User = user
+	}
+
 	if !job.HostReachable {
 		if err := preflightTCP(ctx, host, 22, "ssh", job.SessionID); err != nil {
 			result.Status = 2
@@ -520,13 +559,6 @@ func runLegacySSHCheck(ctx context.Context, job Job, result Result, command stri
 		return result
 	}
 
-	config, err := sshConfigForUser(ctx, job, user)
-	if err != nil {
-		result.Status = 2
-		result.Output = err.Error()
-		logSessionError(job.SessionID, "stage=SSH host=%s service=%s seq=%d result=auth-failed target=%s err=%q", job.HostName, job.ServiceName, job.Sequence, target, result.Output)
-		return result
-	}
 	logSessionInfo(job.SessionID, "stage=SSH host=%s service=%s seq=%d auth=user:%s keys=%s target=%s", job.HostName, job.ServiceName, job.Sequence, config.client.User, strings.Join(config.authSources, ","), target)
 	client, err := ssh.Dial("tcp", net.JoinHostPort(host, "22"), config.client)
 	if err != nil {
@@ -643,6 +675,38 @@ func parseTargetUserHost(target string) (string, string) {
 type sshConfigResult struct {
 	client      *ssh.ClientConfig
 	authSources []string
+}
+
+func ensureSessionSSHAuth(ctx context.Context, job Job) (sshConfigResult, error) {
+	// Coordinate SSH auth checks so only one attempt happens per session.
+	reply := make(chan sessionAuthReply, 1)
+	sessionAuthCh <- sessionAuthRequest{SessionID: job.SessionID, Reply: reply}
+	response := <-reply
+	if response.Leader {
+		config, err := sshConfig(ctx, job)
+		sessionAuthCh <- sessionAuthRequest{
+			SessionID: job.SessionID,
+			Update: &sessionAuthReply{
+				State: sessionAuthReady,
+				Info:  config,
+				Err:   err,
+			},
+		}
+		if err != nil {
+			if shouldLogSessionOnce(sessionLogKey{SessionID: job.SessionID, Label: "ssh-auth-failed"}) {
+				logSessionError(job.SessionID, "stage=SSH auth=failed host=%s err=%q", job.HostName, err.Error())
+			}
+			return sshConfigResult{}, err
+		}
+		if shouldLogSessionOnce(sessionLogKey{SessionID: job.SessionID, Label: "ssh-auth-ready"}) {
+			logSessionInfo(job.SessionID, "stage=SSH auth=ready host=%s keys=%s", job.HostName, strings.Join(config.authSources, ","))
+		}
+		return config, nil
+	}
+	if response.Err != nil {
+		return sshConfigResult{}, response.Err
+	}
+	return response.Info, nil
 }
 
 func sshConfig(ctx context.Context, job Job) (sshConfigResult, error) {
@@ -849,7 +913,16 @@ func init() {
 	}()
 	// Assign colors per session so concurrent logs stay visually grouped.
 	go func() {
-		palette := []string{colorCyan, colorPurple, colorBlue}
+		palette := []string{
+			colorCyan,
+			colorPurple,
+			colorBlue,
+			colorLightBlue,
+			colorLightCyan,
+			colorLightMagenta,
+			colorLightGreen,
+			colorLightYellow,
+		}
 		seen := make(map[uint64]string)
 		nextColor := 0
 		for request := range sessionColorCh {
@@ -861,6 +934,55 @@ func init() {
 			nextColor++
 			seen[request.SessionID] = color
 			request.Reply <- color
+		}
+	}()
+	// Coordinate SSH auth checks so each session does at most one key lookup.
+	go func() {
+		type authState struct {
+			state   sessionAuthState
+			info    sshConfigResult
+			err     error
+			waiters []chan sessionAuthReply
+		}
+		states := make(map[uint64]*authState)
+		for request := range sessionAuthCh {
+			if request.Update != nil {
+				entry, ok := states[request.SessionID]
+				if !ok {
+					entry = &authState{}
+					states[request.SessionID] = entry
+				}
+				entry.state = sessionAuthReady
+				entry.info = request.Update.Info
+				entry.err = request.Update.Err
+				for _, waiter := range entry.waiters {
+					waiter <- sessionAuthReply{
+						State: sessionAuthReady,
+						Info:  entry.info,
+						Err:   entry.err,
+					}
+				}
+				entry.waiters = nil
+				continue
+			}
+			entry, ok := states[request.SessionID]
+			if !ok {
+				entry = &authState{state: sessionAuthUnknown}
+				states[request.SessionID] = entry
+			}
+			switch entry.state {
+			case sessionAuthReady:
+				request.Reply <- sessionAuthReply{
+					State: sessionAuthReady,
+					Info:  entry.info,
+					Err:   entry.err,
+				}
+			case sessionAuthInProgress:
+				entry.waiters = append(entry.waiters, request.Reply)
+			default:
+				entry.state = sessionAuthInProgress
+				request.Reply <- sessionAuthReply{State: sessionAuthInProgress, Leader: true}
+			}
 		}
 	}()
 }

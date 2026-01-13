@@ -287,8 +287,12 @@ func loadKeyringFile() ([]KeyRecord, error) {
 }
 
 func readKeyringFileRaw() ([]keyringFileRecord, error) {
+	// Treat missing files as empty so first-time saves succeed.
 	data, err := os.ReadFile(keyringFilePath)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	var records []keyringFileRecord

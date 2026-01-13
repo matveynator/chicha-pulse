@@ -118,6 +118,7 @@ func main() {
 
 func parseFlags() Configuration {
 	config := Configuration{}
+	flag.Usage = printHelp
 	flag.StringVar(&config.ImportNagiosPath, "import-nagios", "", "Path to Nagios config directory or nagios.cfg")
 	flag.StringVar(&config.WebAddress, "web-addr", ":8080", "HTTP listen address")
 	flag.StringVar(&config.PageTitle, "page-title", "chicha-pulse", "Dashboard title")
@@ -129,6 +130,36 @@ func parseFlags() Configuration {
 	flag.BoolVar(&config.SetupMode, "setup", false, "Run interactive setup")
 	flag.Parse()
 	return config
+}
+
+func printHelp() {
+	cyan := "\033[36m"
+	yellow := "\033[33m"
+	green := "\033[32m"
+	reset := "\033[0m"
+
+	fmt.Fprintf(os.Stderr, "%schicha-pulse%s\n", green, reset)
+	fmt.Fprintf(os.Stderr, "%sUsage:%s chitchat-pulse.go [flags]\n\n", yellow, reset)
+
+	fmt.Fprintf(os.Stderr, "%s1) General settings & setup%s\n", cyan, reset)
+	fmt.Fprintln(os.Stderr, "  -setup                 Run interactive setup wizard")
+	fmt.Fprintln(os.Stderr, "  -web-addr              HTTP listen address (default :8080)")
+	fmt.Fprintln(os.Stderr, "  -page-title            Dashboard title")
+	fmt.Fprintln(os.Stderr, "  -check-interval         Interval between check runs")
+	fmt.Fprintln(os.Stderr, "")
+
+	fmt.Fprintf(os.Stderr, "%s2) Database flags%s\n", cyan, reset)
+	fmt.Fprintln(os.Stderr, "  -db-driver             Database driver (sqlite or postgres)")
+	fmt.Fprintln(os.Stderr, "  -db-dsn                Database DSN")
+	fmt.Fprintln(os.Stderr, "")
+
+	fmt.Fprintf(os.Stderr, "%s3) Import flags%s\n", cyan, reset)
+	fmt.Fprintln(os.Stderr, "  -import-nagios          Path to Nagios config directory or nagios.cfg")
+	fmt.Fprintln(os.Stderr, "")
+
+	fmt.Fprintf(os.Stderr, "%s4) Export flags%s\n", cyan, reset)
+	fmt.Fprintln(os.Stderr, "  (none yet)")
+	fmt.Fprintln(os.Stderr, "")
 }
 
 func validateConfig(config Configuration) error {

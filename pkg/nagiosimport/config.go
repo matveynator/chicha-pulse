@@ -104,7 +104,8 @@ func walkConfigs(ctx context.Context, root string) ([]string, error) {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case files = append(files, path):
+		default:
+			files = append(files, path)
 			return nil
 		}
 	})

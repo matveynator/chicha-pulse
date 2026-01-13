@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -73,6 +74,11 @@ func Run(ctx context.Context) (Settings, error) {
 			settings = mergeSettings(settings, storedFromDB)
 		}
 	}
+	if settings.DatabaseDriver != "" && settings.DatabaseDSN != "" {
+		if dbSummary, ok, err := loadImportSummaryFromDB(settings.DatabaseDriver, settings.DatabaseDSN); err == nil && ok {
+			fmt.Printf("\nDatabase import summary: %d hosts, %d services, %d notifications (from %s).\n", dbSummary.Hosts, dbSummary.Services, dbSummary.Notifications, dbSummary.ConfigFileHint)
+		}
+	}
 	printExistingSettings(settings)
 
 	defaultNagios := fallbackValue(settings.ImportNagiosPath, "/etc/nagios4/nagios.cfg")
@@ -88,7 +94,7 @@ func Run(ctx context.Context) (Settings, error) {
 		return Settings{}, err
 	}
 	if hasPrevious {
-		fmt.Printf("Previously imported: %d hosts, %d services, %d notifications (from %s).\n", previousSummary.Hosts, previousSummary.Services, previousSummary.Notifications, previousSummary.ConfigPath)
+		fmt.Printf("Previously imported: %d hosts, %d services, %d notifications (from %s).\n", previousSummary.Hosts, previousSummary.Services, previousSummary.Notifications, previousSummary.ConfigFileHint)
 	}
 	delta := buildImportDelta(summary, previousSummary, hasPrevious)
 	confirm := "Y"
@@ -105,11 +111,14 @@ func Run(ctx context.Context) (Settings, error) {
 		confirm = prompt(reader, "Import this configuration? [Y/n]: ", "Y")
 	}
 	if strings.ToLower(confirm) == "n" {
-		return Settings{}, fmt.Errorf("import cancelled by user")
+		confirm = "SKIP"
 	}
 	if confirm != "SKIP" {
 		if err := saveImportSummary(summary); err != nil {
 			return Settings{}, err
+		}
+		if err := saveImportSummaryToDB(settings.DatabaseDriver, settings.DatabaseDSN, summary); err != nil {
+			fmt.Fprintf(os.Stderr, "setup db import summary save failed: %v\n", err)
 		}
 	}
 
@@ -609,6 +618,68 @@ func saveImportSummary(summary Summary) error {
 		return err
 	}
 	return os.WriteFile(importSummaryPath(), data, 0o600)
+}
+
+func loadImportSummaryFromDB(driverName, dsn string) (Summary, bool, error) {
+	// Read the last import summary from the database for quick stats.
+	db, err := sql.Open(driverName, dsn)
+	if err != nil {
+		return Summary{}, false, err
+	}
+	defer db.Close()
+	statement := `SELECT hosts, services, notifications, config_path
+FROM setup_import_summary ORDER BY created_at DESC LIMIT 1`
+	row := db.QueryRow(statement)
+	var summary Summary
+	if err := row.Scan(&summary.Hosts, &summary.Services, &summary.Notifications, &summary.ConfigFileHint); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Summary{}, false, nil
+		}
+		return Summary{}, false, err
+	}
+	return summary, true, nil
+}
+
+func saveImportSummaryToDB(driverName, dsn string, summary Summary) error {
+	// Keep the last import summary in the database for future setup runs.
+	if driverName == "" || dsn == "" {
+		return nil
+	}
+	db, err := sql.Open(driverName, dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	schema := `CREATE TABLE IF NOT EXISTS setup_import_summary (
+id TEXT,
+hosts INTEGER,
+services INTEGER,
+notifications INTEGER,
+config_path TEXT,
+created_at TEXT
+)`
+	if _, err := db.Exec(schema); err != nil {
+		return err
+	}
+	statement := fmt.Sprintf(`INSERT INTO setup_import_summary (
+id, hosts, services, notifications, config_path, created_at
+) VALUES (%s, %s, %s, %s, %s, %s)`,
+		placeholder(driverName, 1),
+		placeholder(driverName, 2),
+		placeholder(driverName, 3),
+		placeholder(driverName, 4),
+		placeholder(driverName, 5),
+		placeholder(driverName, 6),
+	)
+	_, err = db.Exec(statement,
+		fmt.Sprintf("%d", time.Now().UnixNano()),
+		summary.Hosts,
+		summary.Services,
+		summary.Notifications,
+		summary.ConfigFileHint,
+		time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	return err
 }
 
 func buildImportDelta(current Summary, previous Summary, hasPrevious bool) importDelta {

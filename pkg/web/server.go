@@ -2,6 +2,8 @@ package web
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"html/template"
 	"net"
 	"net/http"
@@ -51,6 +53,7 @@ func NewServer(st *store.Store, auth AuthConfig, pageTitle string, allowIPs []st
 func (srv *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleIndex)
+	mux.HandleFunc("/events", srv.handleEvents)
 	mux.HandleFunc("/groups", srv.handleAddGroup)
 	mux.HandleFunc("/assign", srv.handleAssignGroup)
 	return srv.basicAuth(mux)
@@ -69,6 +72,46 @@ func (srv *Server) handleIndex(writer http.ResponseWriter, request *http.Request
 	view := buildView(snapshot, srv.pageTitle)
 	if err := srv.template.Execute(writer, view); err != nil {
 		http.Error(writer, "failed to render", http.StatusInternalServerError)
+	}
+}
+
+func (srv *Server) handleEvents(writer http.ResponseWriter, request *http.Request) {
+	flusher, ok := writer.(http.Flusher)
+	if !ok {
+		http.Error(writer, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	// Use SSE so the UI can update without reloading the full page.
+	writer.Header().Set("Content-Type", "text/event-stream")
+	writer.Header().Set("Cache-Control", "no-cache")
+	writer.Header().Set("Connection", "keep-alive")
+
+	ctx := request.Context()
+	stream, stop := srv.store.Subscribe(ctx)
+	defer stop()
+
+	keepAlive := time.NewTicker(15 * time.Second)
+	defer keepAlive.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-keepAlive.C:
+			fmt.Fprint(writer, ": keep-alive\n\n")
+			flusher.Flush()
+		case snapshot, ok := <-stream:
+			if !ok {
+				return
+			}
+			payload := buildStatsPayload(snapshot)
+			data, err := json.Marshal(payload)
+			if err != nil {
+				return
+			}
+			fmt.Fprintf(writer, "data: %s\n\n", data)
+			flusher.Flush()
+		}
 	}
 }
 
@@ -158,6 +201,7 @@ func (srv *Server) isAllowedIP(request *http.Request) bool {
 type pageView struct {
 	Title         string
 	TotalServices int
+	Stats         statsView
 	Groups        []groupView
 	GroupNames    []string
 	Heads         []hostView
@@ -207,6 +251,22 @@ type alertView struct {
 	CheckedAt   string
 }
 
+type statsView struct {
+	Total    int
+	Errors   int
+	Warning  int
+	Critical int
+	Unknown  int
+}
+
+type statsPayload struct {
+	TotalServices int `json:"total_services"`
+	ErrorCount    int `json:"error_count"`
+	WarningCount  int `json:"warning_count"`
+	CriticalCount int `json:"critical_count"`
+	UnknownCount  int `json:"unknown_count"`
+}
+
 // ---- View helpers ----
 
 func buildView(inventory model.Inventory, title string) pageView {
@@ -235,6 +295,7 @@ func buildView(inventory model.Inventory, title string) pageView {
 	return pageView{
 		Title:         title,
 		TotalServices: countServices(inventory),
+		Stats:         buildStats(inventory),
 		Groups:        groups,
 		GroupNames:    groupNames,
 		Heads:         headViews,
@@ -341,6 +402,46 @@ func buildHostView(host *model.Host, parents map[string][]*model.Host, inventory
 		StatusClass: class,
 		Services:    services,
 		Guests:      guests,
+	}
+}
+
+func buildStats(inventory model.Inventory) statsView {
+	// Count statuses by severity so the UI can show error breakdowns.
+	stats := statsView{}
+	for _, host := range inventory.Hosts {
+		for _, service := range host.Services {
+			stats.Total++
+			key := host.Name + "/" + service.Name
+			status, ok := inventory.Statuses[key]
+			if !ok {
+				stats.Unknown++
+				continue
+			}
+			switch status.Status {
+			case 0:
+				// OK results are not errors, but they still contribute to totals.
+			case 1:
+				stats.Warning++
+			case 2:
+				stats.Critical++
+			default:
+				stats.Unknown++
+			}
+		}
+	}
+	stats.Errors = stats.Warning + stats.Critical + stats.Unknown
+	return stats
+}
+
+func buildStatsPayload(inventory model.Inventory) statsPayload {
+	// Convert the internal stats struct into a stable JSON payload.
+	stats := buildStats(inventory)
+	return statsPayload{
+		TotalServices: stats.Total,
+		ErrorCount:    stats.Errors,
+		WarningCount:  stats.Warning,
+		CriticalCount: stats.Critical,
+		UnknownCount:  stats.Unknown,
 	}
 }
 
@@ -544,13 +645,24 @@ const indexTemplate = `<!doctype html>
     table { width: 100%; border-collapse: collapse; }
     th, td { padding: 0.5rem; border-bottom: 1px solid #eee; text-align: left; }
     form.inline { display: inline; }
+    .stats-row { display: flex; flex-wrap: wrap; gap: 1rem; }
+    .stats-item { min-width: 10rem; }
+    .live-indicator { font-weight: bold; color: #2c3e50; }
   </style>
 </head>
 <body>
   <h1>{{.Title}}</h1>
 
   <div class="card">
-    <strong>Total services:</strong> {{.TotalServices}}
+    <h2>Live task stats</h2>
+    <div class="stats-row">
+      <div class="stats-item"><strong>Total services:</strong> <span id="stat-total">{{.Stats.Total}}</span></div>
+      <div class="stats-item"><strong>Errors:</strong> <span id="stat-errors">{{.Stats.Errors}}</span></div>
+      <div class="stats-item">Warning: <span id="stat-warning">{{.Stats.Warning}}</span></div>
+      <div class="stats-item">Critical: <span id="stat-critical">{{.Stats.Critical}}</span></div>
+      <div class="stats-item">Unknown: <span id="stat-unknown">{{.Stats.Unknown}}</span></div>
+    </div>
+    <div class="meta live-indicator" id="stat-connection">Live updates connected.</div>
   </div>
 
   <div class="card">
@@ -623,6 +735,40 @@ const indexTemplate = `<!doctype html>
   {{else}}
     <p>No hosts imported yet.</p>
   {{end}}
+  <script>
+    (function () {
+      // Use SSE to update the stats card without reloading the page.
+      var totalEl = document.getElementById("stat-total");
+      var errorEl = document.getElementById("stat-errors");
+      var warningEl = document.getElementById("stat-warning");
+      var criticalEl = document.getElementById("stat-critical");
+      var unknownEl = document.getElementById("stat-unknown");
+      var connectionEl = document.getElementById("stat-connection");
+
+      if (!window.EventSource) {
+        connectionEl.textContent = "Live updates unavailable (EventSource not supported).";
+        return;
+      }
+
+      var source = new EventSource("/events");
+      source.onmessage = function (event) {
+        try {
+          var payload = JSON.parse(event.data);
+          totalEl.textContent = payload.total_services;
+          errorEl.textContent = payload.error_count;
+          warningEl.textContent = payload.warning_count;
+          criticalEl.textContent = payload.critical_count;
+          unknownEl.textContent = payload.unknown_count;
+          connectionEl.textContent = "Live updates connected.";
+        } catch (err) {
+          connectionEl.textContent = "Live updates received malformed data.";
+        }
+      };
+      source.onerror = function () {
+        connectionEl.textContent = "Live updates disconnected; retrying.";
+      };
+    })();
+  </script>
 </body>
 </html>
 {{define "services"}}

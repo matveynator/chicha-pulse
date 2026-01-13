@@ -35,6 +35,14 @@ type assignRequest struct {
 	group    string
 }
 
+type subscribeRequest struct {
+	response chan chan model.Inventory
+}
+
+type unsubscribeRequest struct {
+	stream chan model.Inventory
+}
+
 // ---- Store ----
 
 // Store keeps the inventory inside one goroutine so callers never race over shared state.
@@ -44,6 +52,8 @@ type Store struct {
 	statusUpdates chan statusRequest
 	groupAdds     chan groupRequest
 	groupAssigns  chan assignRequest
+	subscribes    chan subscribeRequest
+	unsubscribes  chan unsubscribeRequest
 }
 
 // New creates the store and starts the loop that owns the inventory.
@@ -54,6 +64,8 @@ func New(ctx context.Context) *Store {
 		statusUpdates: make(chan statusRequest),
 		groupAdds:     make(chan groupRequest),
 		groupAssigns:  make(chan assignRequest),
+		subscribes:    make(chan subscribeRequest),
+		unsubscribes:  make(chan unsubscribeRequest),
 	}
 	go st.run(ctx)
 	return st
@@ -115,10 +127,33 @@ func (st *Store) AssignHostGroup(ctx context.Context, hostName, group string) er
 	}
 }
 
+// Subscribe delivers inventory snapshots so consumers can react without polling.
+func (st *Store) Subscribe(ctx context.Context) (<-chan model.Inventory, func()) {
+	response := make(chan chan model.Inventory, 1)
+	select {
+	case <-ctx.Done():
+		return closedInventoryStream(), func() {}
+	case st.subscribes <- subscribeRequest{response: response}:
+	}
+	select {
+	case <-ctx.Done():
+		return closedInventoryStream(), func() {}
+	case stream := <-response:
+		stop := func() {
+			select {
+			case st.unsubscribes <- unsubscribeRequest{stream: stream}:
+			default:
+			}
+		}
+		return stream, stop
+	}
+}
+
 // ---- Internal loop ----
 
 func (st *Store) run(ctx context.Context) {
 	inventory := model.NewInventory()
+	subscribers := map[chan model.Inventory]struct{}{}
 
 	for {
 		select {
@@ -126,12 +161,15 @@ func (st *Store) run(ctx context.Context) {
 			return
 		case update := <-st.updates:
 			applyObject(&inventory, update.object)
+			publishSnapshot(inventory, subscribers)
 		case status := <-st.statusUpdates:
 			inventory.Statuses[status.key] = status.status
+			publishSnapshot(inventory, subscribers)
 		case group := <-st.groupAdds:
 			if group.name != "" {
 				inventory.Groups[group.name] = struct{}{}
 			}
+			publishSnapshot(inventory, subscribers)
 		case assignment := <-st.groupAssigns:
 			host, ok := inventory.Hosts[assignment.hostName]
 			if !ok {
@@ -142,10 +180,42 @@ func (st *Store) run(ctx context.Context) {
 				inventory.Groups[assignment.group] = struct{}{}
 				host.Group = assignment.group
 			}
+			publishSnapshot(inventory, subscribers)
 		case request := <-st.requests:
 			request.response <- inventory.Clone()
+		case request := <-st.subscribes:
+			stream := make(chan model.Inventory, 1)
+			subscribers[stream] = struct{}{}
+			stream <- inventory.Clone()
+			request.response <- stream
+		case request := <-st.unsubscribes:
+			if _, ok := subscribers[request.stream]; ok {
+				delete(subscribers, request.stream)
+				close(request.stream)
+			}
 		}
 	}
+}
+
+func publishSnapshot(inventory model.Inventory, subscribers map[chan model.Inventory]struct{}) {
+	// Fan-out snapshots without blocking the store goroutine.
+	if len(subscribers) == 0 {
+		return
+	}
+	snapshot := inventory.Clone()
+	for stream := range subscribers {
+		select {
+		case stream <- snapshot:
+		default:
+		}
+	}
+}
+
+func closedInventoryStream() <-chan model.Inventory {
+	// Return a closed channel so callers can select without extra nil checks.
+	stream := make(chan model.Inventory)
+	close(stream)
+	return stream
 }
 
 // ---- Inventory helpers ----

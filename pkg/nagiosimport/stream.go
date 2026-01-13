@@ -1,0 +1,229 @@
+package nagiosimport
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+	"unicode"
+
+	"chicha-pulse/pkg/model"
+)
+
+// This package streams Nagios configs so larger files can be handled without loading everything.
+
+// ---- Types ----
+
+// ObjectKind describes the Nagios object that was parsed.
+type ObjectKind int
+
+const (
+	KindHost ObjectKind = iota
+	KindService
+)
+
+// Object carries parsed Nagios data to the rest of the pipeline.
+type Object struct {
+	Kind      ObjectKind
+	Host      model.Host
+	Service   model.Service
+	HostNames []string
+}
+
+// ---- Public API ----
+
+// Stream parses Nagios object files and streams parsed objects.
+// It owns the parsing goroutine so downstream code can consume data asynchronously.
+func Stream(ctx context.Context, root string) (<-chan Object, <-chan error) {
+	objectCh := make(chan Object)
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(objectCh)
+		defer close(errCh)
+
+		pathCh := make(chan string)
+		go func() {
+			defer close(pathCh)
+			walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				if entry.IsDir() {
+					return nil
+				}
+				if !strings.HasSuffix(entry.Name(), ".cfg") {
+					return nil
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case pathCh <- path:
+					return nil
+				}
+			})
+			if walkErr != nil && !errors.Is(walkErr, context.Canceled) {
+				errCh <- walkErr
+			}
+		}()
+
+		for {
+			select {
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return
+			case path, ok := <-pathCh:
+				if !ok {
+					return
+				}
+				objects, err := parseFile(path)
+				if err != nil {
+					errCh <- err
+					continue
+				}
+				for _, obj := range objects {
+					select {
+					case <-ctx.Done():
+						errCh <- ctx.Err()
+						return
+					case objectCh <- obj:
+					}
+				}
+			}
+		}
+	}()
+
+	return objectCh, errCh
+}
+
+// ---- Parsing helpers ----
+
+func parseFile(path string) ([]Object, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	return parseObjects(file)
+}
+
+func parseObjects(reader io.Reader) ([]Object, error) {
+	scanner := bufio.NewScanner(reader)
+	var objects []Object
+	var currentType string
+	current := map[string]string{}
+	inBlock := false
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "define") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				currentType = parts[1]
+				current = map[string]string{}
+				inBlock = true
+			}
+			continue
+		}
+		if !inBlock {
+			continue
+		}
+		if line == "}" {
+			if obj, ok := buildObject(currentType, current); ok {
+				objects = append(objects, obj)
+			}
+			inBlock = false
+			continue
+		}
+		key, value, ok := splitDirective(line)
+		if !ok {
+			continue
+		}
+		current[key] = value
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return objects, nil
+}
+
+func splitDirective(line string) (string, string, bool) {
+	index := strings.IndexFunc(line, unicode.IsSpace)
+	if index == -1 {
+		return "", "", false
+	}
+	key := strings.TrimSpace(line[:index])
+	value := strings.TrimSpace(line[index:])
+	value = stripInlineComment(value)
+	if key == "" || value == "" {
+		return "", "", false
+	}
+	return key, value, true
+}
+
+func stripInlineComment(value string) string {
+	for _, marker := range []string{";", "#"} {
+		if idx := strings.Index(value, marker); idx >= 0 {
+			return strings.TrimSpace(value[:idx])
+		}
+	}
+	return value
+}
+
+func buildObject(objectType string, data map[string]string) (Object, bool) {
+	switch objectType {
+	case "host":
+		name := data["host_name"]
+		if name == "" {
+			return Object{}, false
+		}
+		parents := splitList(data["parents"])
+		host := model.Host{
+			Name:    name,
+			Address: data["address"],
+			Parents: parents,
+		}
+		return Object{Kind: KindHost, Host: host}, true
+	case "service":
+		serviceName := data["service_description"]
+		hostNames := splitList(data["host_name"])
+		if serviceName == "" || len(hostNames) == 0 {
+			return Object{}, false
+		}
+		service := model.Service{
+			Name:         serviceName,
+			CheckCommand: data["check_command"],
+			Notes:        data["notes"],
+		}
+		return Object{Kind: KindService, Service: service, HostNames: hostNames}, true
+	default:
+		return Object{}, false
+	}
+}
+
+func splitList(value string) []string {
+	if value == "" {
+		return nil
+	}
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || unicode.IsSpace(r)
+	})
+	var result []string
+	for _, part := range parts {
+		clean := strings.TrimSpace(part)
+		if clean != "" {
+			result = append(result, clean)
+		}
+	}
+	return result
+}

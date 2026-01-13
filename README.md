@@ -71,6 +71,42 @@ One binary. One pulse.
 
 ---
 
+## First monitoring feature
+
+chicha-pulse can import Nagios configuration files with `-import-nagios`, run the
+checks on schedule, and notify a Telegram channel when service state changes. A
+web panel lists head machines, their virtual machines, and all services attached
+per host. Basic auth is enabled for the superadmin by default so the platform can
+evolve into a multi-user model later.
+
+### Supported Nagios objects
+
+- `host` with `host_name`, `address`, and optional `parents`.
+- `service` with `service_description`, `host_name`, and `check_command`.
+
+Hosts without parents are shown as head machines. Hosts that declare a parent are
+shown as virtual machines under that head. Services are attached to each host
+referenced in the Nagios file.
+
+### Example
+
+```bash
+go run . \
+  -import-nagios /path/to/nagios \
+  -superadmin-pass "secret" \
+  -telegram-token "<bot token>" \
+  -telegram-chat-id "<chat id>"
+```
+
+### Database
+
+chicha-pulse uses `database/sql` and expects either a `sqlite` or `postgres`
+driver to be registered. The project ships an internal driver placeholder that
+stores data in memory so the pipeline runs even without external dependencies.
+Provide a real driver implementation later if you need persistence.
+
+---
+
 ## Status
 
 Early stage. Focused on correctness and simplicity.

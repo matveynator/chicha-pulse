@@ -52,8 +52,30 @@ func Run(ctx context.Context) (Settings, error) {
 
 	stored, _ := LoadSettings()
 	settings := stored
-	defaultNagios := fallbackValue(stored.ImportNagiosPath, "/etc/nagios4/nagios.cfg")
 
+	settings.DatabaseDriver = prompt(reader, "Database driver [sqlite]: ", fallbackValue(stored.DatabaseDriver, "sqlite"))
+	settings.DatabaseDriver = strings.ToLower(strings.TrimSpace(settings.DatabaseDriver))
+	if settings.DatabaseDriver == "" {
+		settings.DatabaseDriver = "sqlite"
+	}
+	defaultPort := fallbackValue(strings.TrimPrefix(stored.WebAddress, ":"), "4321")
+	if settings.DatabaseDriver == "postgres" {
+		settings.DatabaseDSN = prompt(reader, "Postgres DSN: ", stored.DatabaseDSN)
+	} else {
+		fallbackDSN := stored.DatabaseDSN
+		if fallbackDSN == "" {
+			fallbackDSN = defaultSQLitePath(":" + defaultPort)
+		}
+		settings.DatabaseDSN = prompt(reader, "SQLite database path: ", fallbackDSN)
+	}
+	if strings.TrimSpace(settings.DatabaseDSN) != "" {
+		if storedFromDB, err := loadSettingsFromDB(settings.DatabaseDriver, settings.DatabaseDSN); err == nil {
+			settings = mergeSettings(settings, storedFromDB)
+		}
+	}
+	printExistingSettings(settings)
+
+	defaultNagios := fallbackValue(settings.ImportNagiosPath, "/etc/nagios4/nagios.cfg")
 	path := prompt(reader, fmt.Sprintf("Nagios config path [%s]: ", defaultNagios), defaultNagios)
 	summary, err := summarizeNagios(ctx, path)
 	if err != nil {
@@ -67,16 +89,15 @@ func Run(ctx context.Context) (Settings, error) {
 	}
 
 	settings.ImportNagiosPath = path
-	settings.TelegramToken = prompt(reader, "Telegram bot token (leave empty to skip): ", stored.TelegramToken)
+	settings.TelegramToken = prompt(reader, "Telegram bot token (leave empty to skip): ", settings.TelegramToken)
 	if settings.TelegramToken != "" {
-		settings.TelegramChatID = prompt(reader, "Telegram chat ID: ", stored.TelegramChatID)
+		settings.TelegramChatID = prompt(reader, "Telegram chat ID: ", settings.TelegramChatID)
 	}
 
-	defaultPort := fallbackValue(strings.TrimPrefix(stored.WebAddress, ":"), "4321")
 	settings.WebAddress = prompt(reader, fmt.Sprintf("Web port [%s]: ", defaultPort), defaultPort)
 	settings.WebAddress = normalizeAddress(settings.WebAddress)
 
-	allowIP := prompt(reader, "Lock web port to a single IP with iptables? (leave empty to skip): ", stored.WebAllowIP)
+	allowIP := prompt(reader, "Lock web port to a single IP with iptables? (leave empty to skip): ", settings.WebAllowIP)
 	if allowIP != "" {
 		if err := applyIptables(ctx, settings.WebAddress, allowIP); err != nil {
 			return Settings{}, err
@@ -84,14 +105,7 @@ func Run(ctx context.Context) (Settings, error) {
 	}
 	settings.WebAllowIP = allowIP
 
-	settings.DatabaseDriver = prompt(reader, "Database driver [sqlite]: ", fallbackValue(stored.DatabaseDriver, "sqlite"))
-	settings.DatabaseDriver = strings.ToLower(strings.TrimSpace(settings.DatabaseDriver))
-	if settings.DatabaseDriver == "" {
-		settings.DatabaseDriver = "sqlite"
-	}
-	if settings.DatabaseDriver == "postgres" {
-		settings.DatabaseDSN = prompt(reader, "Postgres DSN: ", stored.DatabaseDSN)
-	} else {
+	if settings.DatabaseDriver == "sqlite" && strings.TrimSpace(settings.DatabaseDSN) == "" {
 		settings.DatabaseDSN = defaultSQLitePath(settings.WebAddress)
 		fmt.Printf("SQLite database path: %s\n", settings.DatabaseDSN)
 	}
@@ -183,6 +197,41 @@ func printBanner() {
 	fmt.Println(purple + "══════════════════════════════════════" + reset)
 	fmt.Println(cyan + "   chicha-pulse interactive setup" + reset)
 	fmt.Println(purple + "══════════════════════════════════════" + reset)
+}
+
+func printExistingSettings(settings Settings) {
+	// Show current settings so operators can keep what already works.
+	fmt.Println("\nCurrent settings (press Enter to keep defaults):")
+	if settings.ImportNagiosPath != "" {
+		fmt.Printf("- Nagios config: %s\n", settings.ImportNagiosPath)
+	}
+	if settings.WebAddress != "" {
+		fmt.Printf("- Web address: %s\n", settings.WebAddress)
+	}
+	if settings.WebAllowIP != "" {
+		fmt.Printf("- Web allow IP: %s\n", settings.WebAllowIP)
+	}
+	if settings.TelegramToken != "" {
+		fmt.Printf("- Telegram token: %s\n", redactToken(settings.TelegramToken))
+	}
+	if settings.TelegramChatID != "" {
+		fmt.Printf("- Telegram chat ID: %s\n", settings.TelegramChatID)
+	}
+	if settings.DatabaseDriver != "" {
+		fmt.Printf("- Database driver: %s\n", settings.DatabaseDriver)
+	}
+	if settings.DatabaseDSN != "" {
+		fmt.Printf("- Database DSN: %s\n", redactDSN(settings.DatabaseDSN))
+	}
+}
+
+func redactToken(token string) string {
+	// Hide most of the token to avoid leaking secrets in the setup output.
+	trimmed := strings.TrimSpace(token)
+	if len(trimmed) <= 6 {
+		return "***"
+	}
+	return trimmed[:3] + "***" + trimmed[len(trimmed)-3:]
 }
 
 // ---- SSH key setup ----

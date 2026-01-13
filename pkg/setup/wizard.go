@@ -30,11 +30,13 @@ import (
 type Settings struct {
 	ImportNagiosPath string
 	WebAddress       string
-	WebAllowIP       string
+	WebAllowIPs      []string
 	TelegramToken    string
 	TelegramChatID   string
 	DatabaseDriver   string
 	DatabaseDSN      string
+	DomainName       string
+	SSLEmail         string
 }
 
 type Summary struct {
@@ -54,6 +56,7 @@ func Run(ctx context.Context) (Settings, error) {
 	stored, _ := LoadSettings()
 	settings := stored
 
+	printSectionTitle("Database", "Configure storage so setup can reuse existing values.")
 	if strings.TrimSpace(settings.DatabaseDriver) == "" {
 		response, err := prompt(ctx, reader, "Database driver [sqlite]: ", fallbackValue(stored.DatabaseDriver, "sqlite"))
 		if err != nil {
@@ -96,6 +99,7 @@ func Run(ctx context.Context) (Settings, error) {
 	}
 	printExistingSettings(settings)
 
+	printSectionTitle("Nagios import", "Only new inventory is imported; existing items are kept.")
 	defaultNagios := fallbackValue(settings.ImportNagiosPath, "/etc/nagios4/nagios.cfg")
 	path := defaultNagios
 	if strings.TrimSpace(settings.ImportNagiosPath) == "" {
@@ -161,6 +165,8 @@ func Run(ctx context.Context) (Settings, error) {
 	}
 
 	settings.ImportNagiosPath = path
+
+	printSectionTitle("Notifications", "Optional alerts via Telegram.")
 	if strings.TrimSpace(settings.TelegramToken) == "" {
 		response, err := prompt(ctx, reader, "Telegram bot token (leave empty to skip): ", settings.TelegramToken)
 		if err != nil {
@@ -176,6 +182,7 @@ func Run(ctx context.Context) (Settings, error) {
 		settings.TelegramChatID = response
 	}
 
+	printSectionTitle("Web", "Configure the HTTP interface and access rules.")
 	if strings.TrimSpace(settings.WebAddress) == "" {
 		response, err := prompt(ctx, reader, fmt.Sprintf("Web port [%s]: ", defaultPort), defaultPort)
 		if err != nil {
@@ -184,22 +191,46 @@ func Run(ctx context.Context) (Settings, error) {
 		settings.WebAddress = normalizeAddress(response)
 	}
 
-	if strings.TrimSpace(settings.WebAllowIP) == "" {
-		allowIP, err := prompt(ctx, reader, "Lock web port to a single IP with iptables? (leave empty to skip): ", settings.WebAllowIP)
+	if len(settings.WebAllowIPs) == 0 {
+		allowIP, err := prompt(ctx, reader, "Allowed IPs for web access (comma or space separated, leave empty to skip): ", "")
 		if err != nil {
 			return Settings{}, err
 		}
-		if allowIP != "" {
-			if err := applyIptables(ctx, settings.WebAddress, allowIP); err != nil {
-				return Settings{}, err
-			}
+		settings.WebAllowIPs = parseCSVList(allowIP)
+	}
+	if len(settings.WebAllowIPs) > 0 {
+		if err := applyIptables(ctx, settings.WebAddress, settings.WebAllowIPs); err != nil {
+			return Settings{}, err
 		}
-		settings.WebAllowIP = allowIP
 	}
 
 	if settings.DatabaseDriver == "sqlite" && strings.TrimSpace(settings.DatabaseDSN) == "" {
 		settings.DatabaseDSN = defaultSQLitePath(settings.WebAddress)
 		fmt.Printf("SQLite database path: %s\n", settings.DatabaseDSN)
+	}
+
+	printSectionTitle("TLS", "Optional HTTPS with automatic Let's Encrypt certificates.")
+	if strings.TrimSpace(settings.DomainName) == "" {
+		response, err := prompt(ctx, reader, "Domain for HTTPS certificates (leave empty to skip): ", "")
+		if err != nil {
+			return Settings{}, err
+		}
+		settings.DomainName = strings.TrimSpace(response)
+	}
+	if settings.DomainName != "" && strings.TrimSpace(settings.SSLEmail) == "" {
+		response, err := prompt(ctx, reader, "Email for Let's Encrypt alerts: ", settings.SSLEmail)
+		if err != nil {
+			return Settings{}, err
+		}
+		settings.SSLEmail = strings.TrimSpace(response)
+	}
+	if settings.DomainName != "" {
+		if err := ensureLetsEncrypt(ctx, settings.DomainName, settings.SSLEmail); err != nil {
+			return Settings{}, err
+		}
+		if strings.TrimSpace(settings.WebAddress) == "" || settings.WebAddress == ":80" {
+			settings.WebAddress = ":443"
+		}
 	}
 
 	if err := configureSSHKeys(ctx, reader, settings); err != nil {
@@ -256,24 +287,77 @@ func normalizeAddress(port string) string {
 }
 
 func defaultSQLitePath(address string) string {
-	port := strings.TrimPrefix(address, ":")
-	path := filepath.Join("/var/lib/chicha-pulse", fmt.Sprintf("database-%s.sqlite", port))
+	path := filepath.Join("/var/lib/chicha-pulse", "database.sqlite")
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
 	return "file:" + path
 }
 
-func applyIptables(ctx context.Context, address, ip string) error {
+func applyIptables(ctx context.Context, address string, allowIPs []string) error {
+	// Apply allow-list rules first, then drop everything else on the web port.
 	port, err := portFromAddress(address)
 	if err != nil {
 		return err
 	}
-	allow := exec.CommandContext(ctx, "iptables", "-A", "INPUT", "-p", "tcp", "--dport", port, "-s", ip, "-j", "ACCEPT")
-	if output, err := allow.CombinedOutput(); err != nil {
-		return fmt.Errorf("iptables allow failed: %s", strings.TrimSpace(string(output)))
+	for _, ip := range allowIPs {
+		if strings.TrimSpace(ip) == "" {
+			continue
+		}
+		if err := addIptablesRule(ctx, port, ip, "ACCEPT"); err != nil {
+			return err
+		}
 	}
-	deny := exec.CommandContext(ctx, "iptables", "-A", "INPUT", "-p", "tcp", "--dport", port, "-j", "DROP")
-	if output, err := deny.CombinedOutput(); err != nil {
-		return fmt.Errorf("iptables deny failed: %s", strings.TrimSpace(string(output)))
+	return addIptablesRule(ctx, port, "", "DROP")
+}
+
+func EnsureIptables(ctx context.Context, address string, allowIPs []string) error {
+	// Re-apply allow-list rules on restart so the port stays protected.
+	port, err := portFromAddress(address)
+	if err != nil {
+		return err
+	}
+	for _, ip := range allowIPs {
+		clean := strings.TrimSpace(ip)
+		if clean == "" {
+			continue
+		}
+		if !iptablesRuleExists(ctx, port, clean, "ACCEPT") {
+			if err := addIptablesRule(ctx, port, clean, "ACCEPT"); err != nil {
+				return err
+			}
+		}
+	}
+	if len(allowIPs) > 0 && !iptablesRuleExists(ctx, port, "", "DROP") {
+		if err := addIptablesRule(ctx, port, "", "DROP"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func iptablesRuleExists(ctx context.Context, port string, ip string, action string) bool {
+	// Query iptables before adding to avoid duplicate rules.
+	args := []string{"-C", "INPUT", "-p", "tcp", "--dport", port}
+	if ip != "" {
+		args = append(args, "-s", ip)
+	}
+	args = append(args, "-j", action)
+	cmd := exec.CommandContext(ctx, "iptables", args...)
+	if err := cmd.Run(); err != nil {
+		return false
+	}
+	return true
+}
+
+func addIptablesRule(ctx context.Context, port string, ip string, action string) error {
+	// Add a specific iptables rule with clear error reporting.
+	args := []string{"-A", "INPUT", "-p", "tcp", "--dport", port}
+	if ip != "" {
+		args = append(args, "-s", ip)
+	}
+	args = append(args, "-j", action)
+	cmd := exec.CommandContext(ctx, "iptables", args...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("iptables %s failed: %s", strings.ToLower(action), strings.TrimSpace(string(output)))
 	}
 	return nil
 }
@@ -298,6 +382,15 @@ func printBanner() {
 	fmt.Println(purple + "══════════════════════════════════════" + reset)
 }
 
+func printSectionTitle(title string, hint string) {
+	// Use color to separate wizard sections for clarity.
+	cyan := "\033[36m"
+	green := "\033[32m"
+	reset := "\033[0m"
+	fmt.Printf("\n%s[%s]%s %s\n", cyan, title, reset, hint)
+	fmt.Printf("%s──────────────────────────────────────%s\n", green, reset)
+}
+
 func printExistingSettings(settings Settings) {
 	// Show current settings so operators can keep what already works.
 	fmt.Println("\nCurrent settings (press Enter to keep defaults):")
@@ -307,8 +400,8 @@ func printExistingSettings(settings Settings) {
 	if settings.WebAddress != "" {
 		fmt.Printf("- Web address: %s\n", settings.WebAddress)
 	}
-	if settings.WebAllowIP != "" {
-		fmt.Printf("- Web allow IP: %s\n", settings.WebAllowIP)
+	if len(settings.WebAllowIPs) > 0 {
+		fmt.Printf("- Web allow IPs: %s\n", strings.Join(settings.WebAllowIPs, ", "))
 	}
 	if settings.TelegramToken != "" {
 		fmt.Printf("- Telegram token: %s\n", redactToken(settings.TelegramToken))
@@ -321,6 +414,9 @@ func printExistingSettings(settings Settings) {
 	}
 	if settings.DatabaseDSN != "" {
 		fmt.Printf("- Database DSN: %s\n", redactDSN(settings.DatabaseDSN))
+	}
+	if settings.DomainName != "" {
+		fmt.Printf("- TLS domain: %s\n", settings.DomainName)
 	}
 }
 
@@ -338,6 +434,21 @@ type importDelta struct {
 	AddedServices      int
 	AddedNotifications int
 	HasNoNew           bool
+}
+
+func parseCSVList(input string) []string {
+	// Split on commas and whitespace so admins can paste lists quickly.
+	fields := strings.FieldsFunc(input, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n'
+	})
+	var values []string
+	for _, field := range fields {
+		clean := strings.TrimSpace(field)
+		if clean != "" {
+			values = append(values, clean)
+		}
+	}
+	return values
 }
 
 // ---- SSH key setup ----
@@ -601,11 +712,13 @@ func loadSettings() (Settings, error) {
 	return Settings{
 		ImportNagiosPath: parsed["import_nagios"],
 		WebAddress:       parsed["web_addr"],
-		WebAllowIP:       parsed["web_allow_ip"],
+		WebAllowIPs:      parseCSVList(parsed["web_allow_ips"]),
 		TelegramToken:    parsed["telegram_token"],
 		TelegramChatID:   parsed["telegram_chat_id"],
 		DatabaseDriver:   parsed["db_driver"],
 		DatabaseDSN:      parsed["db_dsn"],
+		DomainName:       parsed["domain_name"],
+		SSLEmail:         parsed["ssl_email"],
 	}, nil
 }
 
@@ -631,11 +744,13 @@ func saveSettings(settings Settings) error {
 	content := strings.Join([]string{
 		"import_nagios=" + settings.ImportNagiosPath,
 		"web_addr=" + settings.WebAddress,
-		"web_allow_ip=" + settings.WebAllowIP,
+		"web_allow_ips=" + strings.Join(settings.WebAllowIPs, ","),
 		"telegram_token=" + settings.TelegramToken,
 		"telegram_chat_id=" + settings.TelegramChatID,
 		"db_driver=" + settings.DatabaseDriver,
 		"db_dsn=" + settings.DatabaseDSN,
+		"domain_name=" + settings.DomainName,
+		"ssl_email=" + settings.SSLEmail,
 	}, "\n")
 	if err := saveSettingsToDB(settings); err != nil {
 		fmt.Fprintf(os.Stderr, "setup db save failed: %v\n", err)
@@ -668,8 +783,8 @@ func mergeSettings(base, override Settings) Settings {
 	if strings.TrimSpace(override.WebAddress) != "" {
 		merged.WebAddress = override.WebAddress
 	}
-	if strings.TrimSpace(override.WebAllowIP) != "" {
-		merged.WebAllowIP = override.WebAllowIP
+	if len(override.WebAllowIPs) > 0 {
+		merged.WebAllowIPs = append([]string(nil), override.WebAllowIPs...)
 	}
 	if strings.TrimSpace(override.TelegramToken) != "" {
 		merged.TelegramToken = override.TelegramToken
@@ -682,6 +797,12 @@ func mergeSettings(base, override Settings) Settings {
 	}
 	if strings.TrimSpace(override.DatabaseDSN) != "" {
 		merged.DatabaseDSN = override.DatabaseDSN
+	}
+	if strings.TrimSpace(override.DomainName) != "" {
+		merged.DomainName = override.DomainName
+	}
+	if strings.TrimSpace(override.SSLEmail) != "" {
+		merged.SSLEmail = override.SSLEmail
 	}
 	return merged
 }
@@ -813,21 +934,25 @@ func loadSettingsFromDB(driverName, dsn string) (Settings, error) {
 	}
 	defer db.Close()
 
-	statement := `SELECT import_nagios, web_addr, web_allow_ip, telegram_token, telegram_chat_id, db_driver, db_dsn
+	statement := `SELECT import_nagios, web_addr, web_allow_ips, telegram_token, telegram_chat_id, db_driver, db_dsn, domain_name, ssl_email
 FROM setup_settings ORDER BY updated_at DESC LIMIT 1`
 	row := db.QueryRow(statement)
 	settings := Settings{}
+	var allowIPs string
 	if err := row.Scan(
 		&settings.ImportNagiosPath,
 		&settings.WebAddress,
-		&settings.WebAllowIP,
+		&allowIPs,
 		&settings.TelegramToken,
 		&settings.TelegramChatID,
 		&settings.DatabaseDriver,
 		&settings.DatabaseDSN,
+		&settings.DomainName,
+		&settings.SSLEmail,
 	); err != nil {
 		return Settings{}, err
 	}
+	settings.WebAllowIPs = parseCSVList(allowIPs)
 	return settings, nil
 }
 
@@ -845,19 +970,21 @@ func saveSettingsToDB(settings Settings) error {
 id TEXT,
 import_nagios TEXT,
 web_addr TEXT,
-web_allow_ip TEXT,
+web_allow_ips TEXT,
 telegram_token TEXT,
 telegram_chat_id TEXT,
 db_driver TEXT,
 db_dsn TEXT,
+domain_name TEXT,
+ssl_email TEXT,
 updated_at TEXT
 )`
 	if _, err := db.Exec(schema); err != nil {
 		return err
 	}
 	statement := fmt.Sprintf(`INSERT INTO setup_settings (
-id, import_nagios, web_addr, web_allow_ip, telegram_token, telegram_chat_id, db_driver, db_dsn, updated_at
-) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)`,
+id, import_nagios, web_addr, web_allow_ips, telegram_token, telegram_chat_id, db_driver, db_dsn, domain_name, ssl_email, updated_at
+) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)`,
 		placeholder(settings.DatabaseDriver, 1),
 		placeholder(settings.DatabaseDriver, 2),
 		placeholder(settings.DatabaseDriver, 3),
@@ -867,16 +994,20 @@ id, import_nagios, web_addr, web_allow_ip, telegram_token, telegram_chat_id, db_
 		placeholder(settings.DatabaseDriver, 7),
 		placeholder(settings.DatabaseDriver, 8),
 		placeholder(settings.DatabaseDriver, 9),
+		placeholder(settings.DatabaseDriver, 10),
+		placeholder(settings.DatabaseDriver, 11),
 	)
 	_, err = db.Exec(statement,
 		fmt.Sprintf("%d", time.Now().UnixNano()),
 		settings.ImportNagiosPath,
 		settings.WebAddress,
-		settings.WebAllowIP,
+		strings.Join(settings.WebAllowIPs, ","),
 		settings.TelegramToken,
 		settings.TelegramChatID,
 		settings.DatabaseDriver,
 		settings.DatabaseDSN,
+		settings.DomainName,
+		settings.SSLEmail,
 		time.Now().UTC().Format(time.RFC3339Nano),
 	)
 	return err
@@ -916,6 +1047,39 @@ func sendTelegramTest(ctx context.Context, settings Settings) error {
 	return nil
 }
 
+func ensureLetsEncrypt(ctx context.Context, domain string, email string) error {
+	// Use certbot so HTTPS certificates are issued and auto-renewed by the system.
+	if strings.TrimSpace(domain) == "" {
+		return nil
+	}
+	if strings.TrimSpace(email) == "" {
+		return fmt.Errorf("ssl email is required for Let's Encrypt")
+	}
+	args := []string{
+		"certonly",
+		"--standalone",
+		"--non-interactive",
+		"--agree-tos",
+		"-m", email,
+		"-d", domain,
+	}
+	cmd := exec.CommandContext(ctx, "certbot", args...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("certbot failed: %s", strings.TrimSpace(string(output)))
+	}
+	if err := ensureRenewCron(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ensureRenewCron() error {
+	// Write a cron job so certbot renew runs automatically.
+	cronPath := "/etc/cron.d/chicha-pulse-renew"
+	content := "0 3 * * * root certbot renew --quiet\n"
+	return os.WriteFile(cronPath, []byte(content), 0o644)
+}
+
 func telegramEndpoint(token string) string {
 	return fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
 }
@@ -927,10 +1091,13 @@ func buildSetupMessage(settings Settings) string {
 		fmt.Sprintf("Web: %s", settings.WebAddress),
 		fmt.Sprintf("Database: %s (%s)", settings.DatabaseDriver, redactDSN(settings.DatabaseDSN)),
 	}
-	if settings.WebAllowIP != "" {
-		lines = append(lines, fmt.Sprintf("Web access: locked to %s via iptables", settings.WebAllowIP))
+	if len(settings.WebAllowIPs) > 0 {
+		lines = append(lines, fmt.Sprintf("Web access: locked to %s via iptables", strings.Join(settings.WebAllowIPs, ", ")))
 	} else {
 		lines = append(lines, "Web access: open (no iptables lock)")
+	}
+	if settings.DomainName != "" {
+		lines = append(lines, fmt.Sprintf("TLS domain: %s", settings.DomainName))
 	}
 	ips := listLocalIPs()
 	if len(ips) > 0 {
@@ -994,14 +1161,17 @@ func extractIP(addr net.Addr) string {
 func printAccessSummary(settings Settings) {
 	fmt.Println("\nAccess summary:")
 	fmt.Printf("- Web address: %s\n", settings.WebAddress)
-	if settings.WebAllowIP != "" {
-		fmt.Printf("- Web access locked to: %s\n", settings.WebAllowIP)
+	if len(settings.WebAllowIPs) > 0 {
+		fmt.Printf("- Web access locked to: %s\n", strings.Join(settings.WebAllowIPs, ", "))
 	} else {
 		fmt.Println("- Web access: open (no iptables lock)")
 	}
 	ips := listLocalIPs()
 	if len(ips) > 0 {
 		fmt.Printf("- Local IPs: %s\n", strings.Join(ips, ", "))
+	}
+	if settings.DomainName != "" {
+		fmt.Printf("- TLS domain: %s\n", settings.DomainName)
 	}
 }
 

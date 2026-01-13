@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"html/template"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -29,10 +30,11 @@ type Server struct {
 	auth      AuthConfig
 	template  *template.Template
 	pageTitle string
+	allowIPs  []string
 }
 
 // NewServer prepares the HTTP handler so the caller can run it with a standard net/http server.
-func NewServer(st *store.Store, auth AuthConfig, pageTitle string) (*Server, error) {
+func NewServer(st *store.Store, auth AuthConfig, pageTitle string, allowIPs []string) (*Server, error) {
 	page := template.Must(template.New("index").Funcs(template.FuncMap{
 		"statusBadge": statusBadge,
 	}).Parse(indexTemplate))
@@ -41,6 +43,7 @@ func NewServer(st *store.Store, auth AuthConfig, pageTitle string) (*Server, err
 		auth:      auth,
 		template:  page,
 		pageTitle: pageTitle,
+		allowIPs:  append([]string(nil), allowIPs...),
 	}, nil
 }
 
@@ -104,6 +107,10 @@ func (srv *Server) handleAssignGroup(writer http.ResponseWriter, request *http.R
 
 func (srv *Server) basicAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !srv.isAllowedIP(request) {
+			http.Error(writer, "forbidden", http.StatusForbidden)
+			return
+		}
 		user, pass, ok := request.BasicAuth()
 		if !ok || user != srv.auth.Username || pass != srv.auth.Password {
 			writer.Header().Set("WWW-Authenticate", "Basic realm=\"chicha-pulse\"")
@@ -112,6 +119,38 @@ func (srv *Server) basicAuth(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(writer, request)
 	})
+}
+
+func (srv *Server) isAllowedIP(request *http.Request) bool {
+	// Enforce allow-lists so only trusted IPs reach the UI.
+	if len(srv.allowIPs) == 0 {
+		return true
+	}
+	host, _, err := net.SplitHostPort(request.RemoteAddr)
+	if err != nil {
+		host = request.RemoteAddr
+	}
+	ip := net.ParseIP(strings.TrimSpace(host))
+	if ip == nil {
+		return false
+	}
+	for _, entry := range srv.allowIPs {
+		clean := strings.TrimSpace(entry)
+		if clean == "" {
+			continue
+		}
+		if strings.Contains(clean, "/") {
+			_, block, err := net.ParseCIDR(clean)
+			if err == nil && block.Contains(ip) {
+				return true
+			}
+			continue
+		}
+		if ip.Equal(net.ParseIP(clean)) {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- View models ----

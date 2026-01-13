@@ -39,6 +39,9 @@ type Configuration struct {
 	TelegramChatID   string
 	DatabaseDriver   string
 	DatabaseDSN      string
+	DomainName       string
+	SSLEmail         string
+	WebAllowIPs      []string
 	SetupMode        bool
 }
 
@@ -69,6 +72,13 @@ func main() {
 	if err := validateConfig(config); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
+	}
+
+	if len(config.WebAllowIPs) > 0 {
+		if err := setup.EnsureIptables(ctx, config.WebAddress, config.WebAllowIPs); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	}
 
 	st := store.New(ctx)
@@ -111,7 +121,7 @@ func main() {
 		log.Printf("failed to store web credentials: %v", err)
 	}
 
-	srv, err := web.NewServer(st, auth, config.PageTitle)
+	srv, err := web.NewServer(st, auth, config.PageTitle, config.WebAllowIPs)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -120,6 +130,14 @@ func main() {
 	httpServer := &http.Server{
 		Addr:    config.WebAddress,
 		Handler: srv.Handler(),
+	}
+
+	if config.DomainName != "" {
+		if err := runTLS(ctx, httpServer, config.DomainName); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	if err := web.Run(ctx, httpServer); err != nil {
@@ -177,6 +195,12 @@ func applySettings(config Configuration, settings setup.Settings) Configuration 
 	config.TelegramChatID = settings.TelegramChatID
 	config.DatabaseDriver = settings.DatabaseDriver
 	config.DatabaseDSN = settings.DatabaseDSN
+	config.DomainName = settings.DomainName
+	config.SSLEmail = settings.SSLEmail
+	config.WebAllowIPs = append([]string(nil), settings.WebAllowIPs...)
+	if config.DomainName != "" {
+		config.WebAddress = ":443"
+	}
 	return config
 }
 
@@ -305,4 +329,36 @@ func closeDatabase(database *storage.Store) {
 	if err := database.Close(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 	}
+}
+
+func runTLS(ctx context.Context, server *http.Server, domain string) error {
+	// Serve HTTPS with a redirect server on port 80 for convenience.
+	certFile := fmt.Sprintf("/etc/letsencrypt/live/%s/fullchain.pem", domain)
+	keyFile := fmt.Sprintf("/etc/letsencrypt/live/%s/privkey.pem", domain)
+	redirectServer := &http.Server{
+		Addr: ":80",
+		Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			target := "https://" + domain + request.URL.RequestURI()
+			http.Redirect(writer, request, target, http.StatusMovedPermanently)
+		}),
+	}
+	go func() {
+		if err := web.Run(ctx, redirectServer); err != nil {
+			log.Printf("redirect server stopped: %v", err)
+		}
+	}()
+	return runTLSWithContext(ctx, server, certFile, keyFile)
+}
+
+func runTLSWithContext(ctx context.Context, server *http.Server, certFile string, keyFile string) error {
+	// Respect context cancellation while serving TLS.
+	shutdownErr := make(chan error, 1)
+	go func() {
+		<-ctx.Done()
+		shutdownErr <- server.Shutdown(context.Background())
+	}()
+	if err := server.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return <-shutdownErr
 }

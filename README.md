@@ -1,2 +1,47 @@
 # chicha-pulse
-Linux servers, VMs, and clusters under one pulse. Monitor, inventory, and migrate — in one binary.
+
+**Infrastructure health & control platform**
+
+chicha-pulse is a **single-binary platform** for monitoring, inventory, and lifecycle management of Linux infrastructure.  
+It provides real-time visibility and control over **Linux servers, virtual machines, and clusters** — all from one tool.
+
+With chicha-pulse, you can monitor system health, track infrastructure inventory, create and migrate virtual machines, and operate clusters through a unified control plane.
+
+No agents zoo.  
+No external dependencies.  
+One binary. One pulse.
+
+---
+
+## Key Features
+
+- **Single static binary**
+- **Linux-first**
+- Infrastructure health monitoring
+- Server and VM inventory
+- Virtual machine lifecycle management
+- Live VM migration
+- Unified control plane (CLI + API)
+- Embedded storage and web UI
+
+---
+
+## Philosophy
+
+chicha-pulse is designed to be:
+- simple to deploy
+- easy to operate
+- predictable in production
+
+No complex stacks. No service sprawl.  
+Everything you need — in one pulse.
+
+---
+
+## Usage
+
+```bash
+chicha-pulse run
+chicha-pulse agent
+chicha-pulse vm create
+chicha-pulse migrate vm01 node02

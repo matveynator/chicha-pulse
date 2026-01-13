@@ -7,9 +7,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"chicha-pulse/pkg/checker"
+	"chicha-pulse/pkg/web"
 )
 
 // This package isolates database/sql usage so drivers can be swapped later.
@@ -56,11 +58,35 @@ func Start(ctx context.Context, store *Store, results <-chan checker.Result) err
 				if !ok {
 					return
 				}
-				_ = insertResult(ctx, store, result)
+				if err := insertResult(ctx, store, result); err != nil {
+					log.Printf("db insert failed host=%s service=%s err=%v", result.HostName, result.ServiceName, err)
+				}
 			}
 		}
 	}()
 	return nil
+}
+
+// SaveAuth stores web credentials so operators can retrieve them later.
+func SaveAuth(ctx context.Context, store *Store, auth web.AuthConfig) error {
+	if store == nil {
+		return errors.New("database is required")
+	}
+	statement := fmt.Sprintf(`INSERT INTO auth_credentials (
+		username,
+		password,
+		created_at
+	) VALUES (%s, %s, %s)`,
+		placeholder(store.driverName, 1),
+		placeholder(store.driverName, 2),
+		placeholder(store.driverName, 3),
+	)
+	_, err := store.database.ExecContext(ctx, statement,
+		auth.Username,
+		auth.Password,
+		time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	return err
 }
 
 // ---- Schema ----
@@ -75,7 +101,15 @@ func ensureSchema(ctx context.Context, store *Store) error {
 		output TEXT,
 		checked_at TEXT
 	)`
-	_, err := store.database.ExecContext(ctx, statement)
+	if _, err := store.database.ExecContext(ctx, statement); err != nil {
+		return err
+	}
+	authStatement := `CREATE TABLE IF NOT EXISTS auth_credentials (
+		username TEXT,
+		password TEXT,
+		created_at TEXT
+	)`
+	_, err := store.database.ExecContext(ctx, authStatement)
 	return err
 }
 

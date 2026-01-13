@@ -4,6 +4,7 @@ package checker
 
 import (
 	"context"
+	"log"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -158,6 +159,7 @@ func runCheck(ctx context.Context, job Job) Result {
 		return result
 	}
 
+	log.Printf("check start host=%s service=%s command=%q", job.HostName, job.ServiceName, command)
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
 	output, err := cmd.CombinedOutput()
 	result.Output = strings.TrimSpace(string(output))
@@ -170,6 +172,7 @@ func runCheck(ctx context.Context, job Job) Result {
 		if result.Output == "" {
 			result.Output = err.Error()
 		}
+		log.Printf("check error host=%s service=%s status=%d output=%q", job.HostName, job.ServiceName, result.Status, result.Output)
 		return result
 	}
 
@@ -177,5 +180,6 @@ func runCheck(ctx context.Context, job Job) Result {
 	if result.Output == "" {
 		result.Output = "ok"
 	}
+	log.Printf("check ok host=%s service=%s output=%q", job.HostName, job.ServiceName, result.Output)
 	return result
 }

@@ -97,6 +97,9 @@ func main() {
 	auth := generateAuth()
 	log.Printf("web auth username: %s", auth.Username)
 	log.Printf("web auth password: %s", auth.Password)
+	if err := storage.SaveAuth(ctx, database, auth); err != nil {
+		log.Printf("failed to store web credentials: %v", err)
+	}
 
 	srv, err := web.NewServer(st, auth, config.PageTitle)
 	if err != nil {

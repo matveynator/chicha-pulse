@@ -135,7 +135,7 @@ func main() {
 	}
 
 	if config.DomainName != "" {
-		if err := runTLS(ctx, httpServer, config.DomainName); err != nil {
+		if err := runTLS(ctx, httpServer, config.DomainName, config.SSLEmail); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -333,13 +333,27 @@ func closeDatabase(database *storage.Store) {
 	}
 }
 
-func runTLS(ctx context.Context, server *http.Server, domain string) error {
+func runTLS(ctx context.Context, server *http.Server, domain string, email string) error {
 	// Serve HTTPS with a redirect server on port 80 for convenience.
 	// We generate or refresh certificates here so runtime TLS always has material to load.
-	paths, err := tlsmanager.Ensure(ctx, tlsmanager.Config{Domain: domain})
+	paths, err := tlsmanager.Ensure(ctx, tlsmanager.Config{Domain: domain, Email: email})
 	if err != nil {
 		return err
 	}
+	// Renewal runs on a daily cadence so certificates stay fresh.
+	renewErrs := tlsmanager.StartRenewal(ctx, tlsmanager.Config{Domain: domain, Email: email}, 24*time.Hour)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case err := <-renewErrs:
+				if err != nil {
+					log.Printf("tls renewal failed: %v", err)
+				}
+			}
+		}
+	}()
 	// The broker keeps TLS reloading serialized without mutexes.
 	broker := tlsmanager.NewBroker(ctx, paths, time.Minute)
 	server.TLSConfig = &tls.Config{

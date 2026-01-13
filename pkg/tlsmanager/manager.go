@@ -38,6 +38,7 @@ type Paths struct {
 const defaultBaseDir = "/etc/chicha-pulse/tls"
 const defaultRenewBefore = 30 * 24 * time.Hour
 const defaultCertificateTTL = 90 * 24 * time.Hour
+const defaultRenewInterval = 24 * time.Hour
 
 // ---- Public API ----
 
@@ -86,6 +87,33 @@ func NewBroker(ctx context.Context, paths Paths, reloadEvery time.Duration) *Bro
 	broker := &Broker{requests: requests}
 	go broker.run(ctx, paths, reloadEvery)
 	return broker
+}
+
+// StartRenewal launches a goroutine that periodically calls Ensure to refresh certificates.
+func StartRenewal(ctx context.Context, config Config, renewEvery time.Duration) <-chan error {
+	// A dedicated goroutine keeps renewals off the main path and avoids locks.
+	if renewEvery <= 0 {
+		renewEvery = defaultRenewInterval
+	}
+	errs := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(renewEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if _, err := Ensure(ctx, config); err != nil {
+					select {
+					case errs <- err:
+					default:
+					}
+				}
+			}
+		}
+	}()
+	return errs
 }
 
 // ---- Broker ----

@@ -66,6 +66,9 @@ func Run(ctx context.Context) (Settings, error) {
 		if settings.DatabaseDriver == "" {
 			settings.DatabaseDriver = "sqlite"
 		}
+		if err := persistSettings(settings); err != nil {
+			return Settings{}, err
+		}
 	}
 	defaultPort := fallbackValue(strings.TrimPrefix(stored.WebAddress, ":"), "4321")
 	if strings.TrimSpace(settings.DatabaseDSN) == "" {
@@ -75,6 +78,9 @@ func Run(ctx context.Context) (Settings, error) {
 				return Settings{}, err
 			}
 			settings.DatabaseDSN = response
+			if err := persistSettings(settings); err != nil {
+				return Settings{}, err
+			}
 		} else {
 			fallbackDSN := stored.DatabaseDSN
 			if fallbackDSN == "" {
@@ -85,6 +91,9 @@ func Run(ctx context.Context) (Settings, error) {
 				return Settings{}, err
 			}
 			settings.DatabaseDSN = response
+			if err := persistSettings(settings); err != nil {
+				return Settings{}, err
+			}
 		}
 	}
 	if strings.TrimSpace(settings.DatabaseDSN) != "" {
@@ -170,6 +179,9 @@ func Run(ctx context.Context) (Settings, error) {
 	}
 
 	settings.ImportNagiosPath = path
+	if err := persistSettings(settings); err != nil {
+		return Settings{}, err
+	}
 
 	printSectionTitle("Notifications", "Optional alerts via Telegram.")
 	if strings.TrimSpace(settings.TelegramToken) == "" {
@@ -178,6 +190,9 @@ func Run(ctx context.Context) (Settings, error) {
 			return Settings{}, err
 		}
 		settings.TelegramToken = response
+		if err := persistSettings(settings); err != nil {
+			return Settings{}, err
+		}
 	}
 	if settings.TelegramToken != "" && strings.TrimSpace(settings.TelegramChatID) == "" {
 		response, err := prompt(ctx, reader, "Telegram chat ID: ", settings.TelegramChatID)
@@ -185,6 +200,9 @@ func Run(ctx context.Context) (Settings, error) {
 			return Settings{}, err
 		}
 		settings.TelegramChatID = response
+		if err := persistSettings(settings); err != nil {
+			return Settings{}, err
+		}
 	}
 
 	printSectionTitle("Web", "Configure the HTTP interface and access rules.")
@@ -194,6 +212,9 @@ func Run(ctx context.Context) (Settings, error) {
 			return Settings{}, err
 		}
 		settings.WebAddress = normalizeAddress(response)
+		if err := persistSettings(settings); err != nil {
+			return Settings{}, err
+		}
 	}
 
 	if len(settings.WebAllowIPs) == 0 {
@@ -202,6 +223,9 @@ func Run(ctx context.Context) (Settings, error) {
 			return Settings{}, err
 		}
 		settings.WebAllowIPs = parseCSVList(allowIP)
+		if err := persistSettings(settings); err != nil {
+			return Settings{}, err
+		}
 	}
 	if len(settings.WebAllowIPs) > 0 {
 		if err := applyIptables(ctx, settings.WebAddress, settings.WebAllowIPs); err != nil {
@@ -212,6 +236,9 @@ func Run(ctx context.Context) (Settings, error) {
 	if settings.DatabaseDriver == "sqlite" && strings.TrimSpace(settings.DatabaseDSN) == "" {
 		settings.DatabaseDSN = defaultSQLitePath(settings.WebAddress)
 		fmt.Printf("SQLite database path: %s\n", settings.DatabaseDSN)
+		if err := persistSettings(settings); err != nil {
+			return Settings{}, err
+		}
 	}
 
 	printSectionTitle("TLS", "Optional HTTPS with automatic TLS certificates managed by the app.")
@@ -221,6 +248,9 @@ func Run(ctx context.Context) (Settings, error) {
 			return Settings{}, err
 		}
 		settings.DomainName = strings.TrimSpace(response)
+		if err := persistSettings(settings); err != nil {
+			return Settings{}, err
+		}
 	}
 	if settings.DomainName != "" && strings.TrimSpace(settings.SSLEmail) == "" {
 		response, err := prompt(ctx, reader, "Email for TLS certificate alerts: ", settings.SSLEmail)
@@ -228,6 +258,9 @@ func Run(ctx context.Context) (Settings, error) {
 			return Settings{}, err
 		}
 		settings.SSLEmail = strings.TrimSpace(response)
+		if err := persistSettings(settings); err != nil {
+			return Settings{}, err
+		}
 	}
 	if settings.DomainName != "" {
 		if err := ensureLetsEncrypt(ctx, settings.DomainName, settings.SSLEmail); err != nil {
@@ -235,6 +268,9 @@ func Run(ctx context.Context) (Settings, error) {
 		}
 		if strings.TrimSpace(settings.WebAddress) == "" || settings.WebAddress == ":80" {
 			settings.WebAddress = ":443"
+			if err := persistSettings(settings); err != nil {
+				return Settings{}, err
+			}
 		}
 	}
 
@@ -255,6 +291,15 @@ func Run(ctx context.Context) (Settings, error) {
 	}
 
 	return settings, nil
+}
+
+// persistSettings stores each input in the database so setup can resume without retyping.
+func persistSettings(settings Settings) error {
+	// We skip DB writes until the storage configuration is known.
+	if settings.DatabaseDriver == "" || settings.DatabaseDSN == "" {
+		return nil
+	}
+	return saveSettingsToDB(settings)
 }
 
 // ---- Prompt helpers ----

@@ -5,6 +5,7 @@ import (
 	"html/template"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -266,7 +267,7 @@ func buildHostView(host *model.Host, parents map[string][]*model.Host, inventory
 		label, class := statusLabelFromStatus(status, ok)
 		services = append(services, serviceView{
 			Name:        service.Name,
-			Command:     service.CheckCommand,
+			Command:     displayServiceCommand(host, service),
 			Notes:       service.Notes,
 			Interval:    service.CheckIntervalMinutes,
 			SSHUser:     service.SSHUser,
@@ -390,6 +391,90 @@ func formatTime(value time.Time) string {
 		return ""
 	}
 	return value.Format(time.RFC3339)
+}
+
+func displayServiceCommand(host *model.Host, service model.Service) string {
+	// Prefer showing the native ssh command so operators see the real connection shape.
+	if command, ok := legacySSHDisplayCommand(service.CheckCommand); ok {
+		return command
+	}
+	if command := buildSSHCommandDisplay(host, service); command != "" {
+		return command
+	}
+	return service.CheckCommand
+}
+
+func legacySSHDisplayCommand(command string) (string, bool) {
+	// Translate legacy check_ssh invocations into a plain ssh command for readability.
+	fields := strings.Fields(command)
+	for index, field := range fields {
+		if strings.HasSuffix(field, "check_ssh") || strings.Contains(field, "/check_ssh") {
+			if index+1 >= len(fields) {
+				return "", false
+			}
+			target := fields[index+1]
+			remoteCommand := ""
+			if index+2 < len(fields) {
+				remoteCommand = normalizeRemoteCommand(strings.Join(fields[index+2:], " "))
+			}
+			parts := []string{"ssh", target}
+			if remoteCommand != "" {
+				parts = append(parts, remoteCommand)
+			}
+			return strings.Join(parts, " "), true
+		}
+	}
+	return "", false
+}
+
+func buildSSHCommandDisplay(host *model.Host, service model.Service) string {
+	// Use the parsed SSH settings so check_by_ssh commands read as standard ssh.
+	if service.SSHCommand == "" && service.SSHUser == "" && service.SSHKeyPath == "" && service.SSHPort == 0 {
+		return ""
+	}
+	address := host.Address
+	if address == "" {
+		address = host.Name
+	}
+	if address == "" {
+		return ""
+	}
+	target := address
+	if strings.TrimSpace(service.SSHUser) != "" {
+		target = service.SSHUser + "@" + address
+	}
+	parts := []string{"ssh"}
+	if service.SSHPort != 0 {
+		parts = append(parts, "-p", strconv.Itoa(service.SSHPort))
+	}
+	if strings.TrimSpace(service.SSHKeyPath) != "" {
+		parts = append(parts, "-i", service.SSHKeyPath)
+	}
+	parts = append(parts, target)
+	if strings.TrimSpace(service.SSHCommand) != "" {
+		parts = append(parts, service.SSHCommand)
+	}
+	return strings.Join(parts, " ")
+}
+
+func normalizeRemoteCommand(command string) string {
+	// Unquote commands so the display stays readable and matches ssh expectations.
+	trimmed := strings.TrimSpace(command)
+	unescaped := strings.ReplaceAll(trimmed, "\\\"", "\"")
+	unescaped = strings.ReplaceAll(unescaped, "\\'", "'")
+	if len(unescaped) < 2 {
+		return unescaped
+	}
+	first := unescaped[0]
+	last := unescaped[len(unescaped)-1]
+	if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+		unquoted, err := strconv.Unquote(unescaped)
+		if err == nil {
+			return unquoted
+		}
+		return strings.Trim(unescaped, "\"'")
+	}
+	return unescaped
 }
 
 // ---- Templates ----

@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -53,32 +54,90 @@ type Result struct {
 const (
 	colorReset  = "\033[0m"
 	colorBlue   = "\033[34m"
+	colorCyan   = "\033[36m"
 	colorGreen  = "\033[32m"
 	colorYellow = "\033[33m"
 	colorRed    = "\033[31m"
 	colorPurple = "\033[35m"
+	colorGray   = "\033[90m"
 )
 
-func logSession(sessionID uint64, color string, format string, args ...any) {
+func logSession(sessionID uint64, format string, args ...any) {
 	// Colorized session logs make it easier to follow the execution stages in order.
 	message := fmt.Sprintf(format, args...)
-	log.Printf("%ssession=%d %s%s", color, sessionID, message, colorReset)
+	sessionColor := sessionLogColor(sessionID)
+	message = colorizeLogMessage(message, sessionColor)
+	log.Printf("%ssession=%d %s%s", sessionColor, sessionID, message, colorReset)
 }
 
 func logSessionInfo(sessionID uint64, format string, args ...any) {
-	logSession(sessionID, colorBlue, format, args...)
+	logSession(sessionID, format, args...)
 }
 
 func logSessionWarn(sessionID uint64, format string, args ...any) {
-	logSession(sessionID, colorYellow, format, args...)
+	logSession(sessionID, format, args...)
 }
 
 func logSessionError(sessionID uint64, format string, args ...any) {
-	logSession(sessionID, colorRed, format, args...)
+	logSession(sessionID, format, args...)
 }
 
 func logSessionSuccess(sessionID uint64, format string, args ...any) {
-	logSession(sessionID, colorGreen, format, args...)
+	logSession(sessionID, format, args...)
+}
+
+// ---- Log color coordination ----
+
+type sessionColorRequest struct {
+	SessionID uint64
+	Reply     chan string
+}
+
+var sessionColorCh = make(chan sessionColorRequest)
+
+var statusWordPattern = regexp.MustCompile(`\b(ok|warning|critical|unknown)\b`)
+var errorWordPattern = regexp.MustCompile(`\b(error|failed)\b`)
+var errorFieldPattern = regexp.MustCompile(`\b(err|error)=("[^"]*"|\S+)`)
+
+func sessionLogColor(sessionID uint64) string {
+	// Keep session colors consistent so related lines are easy to scan.
+	reply := make(chan string, 1)
+	sessionColorCh <- sessionColorRequest{SessionID: sessionID, Reply: reply}
+	return <-reply
+}
+
+func colorizeLogMessage(message string, baseColor string) string {
+	// Highlight status keywords and error details while keeping the base session color.
+	message = errorFieldPattern.ReplaceAllStringFunc(message, func(match string) string {
+		parts := strings.SplitN(match, "=", 2)
+		if len(parts) != 2 {
+			return match
+		}
+		return fmt.Sprintf("%s=%s%s%s", parts[0], colorRed, parts[1], baseColor)
+	})
+	message = errorWordPattern.ReplaceAllStringFunc(message, func(match string) string {
+		return colorRed + match + baseColor
+	})
+	message = statusWordPattern.ReplaceAllStringFunc(message, func(match string) string {
+		return statusWordColor(match) + match + baseColor
+	})
+	return message
+}
+
+func statusWordColor(word string) string {
+	// Map status words to the palette so logs align with UI color conventions.
+	switch strings.ToLower(word) {
+	case "ok":
+		return colorGreen
+	case "warning":
+		return colorYellow
+	case "critical":
+		return colorRed
+	case "unknown":
+		return colorGray
+	default:
+		return colorReset
+	}
 }
 
 // ---- Public pipeline ----
@@ -786,6 +845,22 @@ func init() {
 			}
 			seen[request.Key] = true
 			request.Reply <- true
+		}
+	}()
+	// Assign colors per session so concurrent logs stay visually grouped.
+	go func() {
+		palette := []string{colorCyan, colorPurple, colorBlue}
+		seen := make(map[uint64]string)
+		nextColor := 0
+		for request := range sessionColorCh {
+			if color, ok := seen[request.SessionID]; ok {
+				request.Reply <- color
+				continue
+			}
+			color := palette[nextColor%len(palette)]
+			nextColor++
+			seen[request.SessionID] = color
+			request.Reply <- color
 		}
 	}()
 }

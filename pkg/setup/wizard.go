@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"chicha-pulse/pkg/model"
 	"chicha-pulse/pkg/nagiosimport"
 	"chicha-pulse/pkg/sshkeys"
+	"chicha-pulse/pkg/tlsmanager"
 )
 
 // Package setup provides an interactive wizard so the first run is self-guided.
@@ -29,11 +31,13 @@ import (
 type Settings struct {
 	ImportNagiosPath string
 	WebAddress       string
-	WebAllowIP       string
+	WebAllowIPs      []string
 	TelegramToken    string
 	TelegramChatID   string
 	DatabaseDriver   string
 	DatabaseDSN      string
+	DomainName       string
+	SSLEmail         string
 }
 
 type Summary struct {
@@ -52,48 +56,223 @@ func Run(ctx context.Context) (Settings, error) {
 
 	stored, _ := LoadSettings()
 	settings := stored
-	defaultNagios := fallbackValue(stored.ImportNagiosPath, "/etc/nagios4/nagios.cfg")
 
-	path := prompt(reader, fmt.Sprintf("Nagios config path [%s]: ", defaultNagios), defaultNagios)
+	printSectionTitle("Database", "Configure storage so setup can reuse existing values.")
+	if strings.TrimSpace(settings.DatabaseDriver) == "" {
+		response, err := prompt(ctx, reader, "Database driver [sqlite]: ", fallbackValue(stored.DatabaseDriver, "sqlite"))
+		if err != nil {
+			return Settings{}, err
+		}
+		settings.DatabaseDriver = strings.ToLower(strings.TrimSpace(response))
+		if settings.DatabaseDriver == "" {
+			settings.DatabaseDriver = "sqlite"
+		}
+		if err := persistSettings(settings); err != nil {
+			return Settings{}, err
+		}
+	}
+	defaultPort := fallbackValue(strings.TrimPrefix(stored.WebAddress, ":"), "4321")
+	if strings.TrimSpace(settings.DatabaseDSN) == "" {
+		if settings.DatabaseDriver == "postgres" {
+			response, err := prompt(ctx, reader, fmt.Sprintf("Postgres DSN [%s]: ", stored.DatabaseDSN), stored.DatabaseDSN)
+			if err != nil {
+				return Settings{}, err
+			}
+			settings.DatabaseDSN = response
+			if err := persistSettings(settings); err != nil {
+				return Settings{}, err
+			}
+		} else {
+			fallbackDSN := stored.DatabaseDSN
+			if fallbackDSN == "" {
+				fallbackDSN = defaultSQLitePath(":" + defaultPort)
+			}
+			response, err := prompt(ctx, reader, fmt.Sprintf("SQLite database path [%s]: ", fallbackDSN), fallbackDSN)
+			if err != nil {
+				return Settings{}, err
+			}
+			settings.DatabaseDSN = response
+			if err := persistSettings(settings); err != nil {
+				return Settings{}, err
+			}
+		}
+	}
+	if strings.TrimSpace(settings.DatabaseDSN) != "" {
+		if storedFromDB, err := loadSettingsFromDB(settings.DatabaseDriver, settings.DatabaseDSN); err == nil {
+			settings = mergeSettings(settings, storedFromDB)
+		}
+	}
+	if settings.DatabaseDriver != "" && settings.DatabaseDSN != "" {
+		if dbSummary, ok, err := loadImportSummaryFromDB(settings.DatabaseDriver, settings.DatabaseDSN); err == nil && ok {
+			fmt.Printf("\nDatabase import summary: %d hosts, %d services, %d notifications (from %s).\n", dbSummary.Hosts, dbSummary.Services, dbSummary.Notifications, dbSummary.ConfigFileHint)
+		}
+	}
+	printExistingSettings(settings)
+	if len(settings.WebAllowIPs) > 0 && settings.WebAddress != "" {
+		if err := EnsureIptables(ctx, settings.WebAddress, settings.WebAllowIPs); err != nil {
+			return Settings{}, err
+		}
+	}
+
+	printSectionTitle("Nagios import", "Only new inventory is imported; existing items are kept.")
+	defaultNagios := fallbackValue(settings.ImportNagiosPath, "/etc/nagios4/nagios.cfg")
+	path := defaultNagios
+	if strings.TrimSpace(settings.ImportNagiosPath) == "" {
+		response, err := prompt(ctx, reader, fmt.Sprintf("Nagios config path [%s]: ", defaultNagios), defaultNagios)
+		if err != nil {
+			return Settings{}, err
+		}
+		path = response
+	}
 	summary, err := summarizeNagios(ctx, path)
 	if err != nil {
 		return Settings{}, err
 	}
 
 	fmt.Printf("\nFound Nagios: %d hosts, %d services, %d notifications (from %s).\n", summary.Hosts, summary.Services, summary.Notifications, summary.ConfigFileHint)
-	confirm := prompt(reader, "Import this configuration? [Y/n]: ", "Y")
-	if strings.ToLower(confirm) == "n" {
-		return Settings{}, fmt.Errorf("import cancelled by user")
+	previousSummary, hasPrevious, err := loadImportSummary()
+	if err != nil {
+		return Settings{}, err
 	}
-
-	settings.ImportNagiosPath = path
-	settings.TelegramToken = prompt(reader, "Telegram bot token (leave empty to skip): ", stored.TelegramToken)
-	if settings.TelegramToken != "" {
-		settings.TelegramChatID = prompt(reader, "Telegram chat ID: ", stored.TelegramChatID)
+	if !hasPrevious {
+		if dbSummary, ok, dbErr := loadImportSummaryFromDB(settings.DatabaseDriver, settings.DatabaseDSN); dbErr == nil && ok {
+			previousSummary = dbSummary
+			hasPrevious = true
+		}
 	}
-
-	defaultPort := fallbackValue(strings.TrimPrefix(stored.WebAddress, ":"), "4321")
-	settings.WebAddress = prompt(reader, fmt.Sprintf("Web port [%s]: ", defaultPort), defaultPort)
-	settings.WebAddress = normalizeAddress(settings.WebAddress)
-
-	allowIP := prompt(reader, "Lock web port to a single IP with iptables? (leave empty to skip): ", stored.WebAllowIP)
-	if allowIP != "" {
-		if err := applyIptables(ctx, settings.WebAddress, allowIP); err != nil {
+	if hasPrevious {
+		fmt.Printf("Previously imported: %d hosts, %d services, %d notifications (from %s).\n", previousSummary.Hosts, previousSummary.Services, previousSummary.Notifications, previousSummary.ConfigFileHint)
+	}
+	delta := buildImportDelta(summary, previousSummary, hasPrevious)
+	confirm := "Y"
+	if hasPrevious && delta.HasNoNew {
+		fmt.Println("All services already imported.")
+		confirm, err = prompt(ctx, reader, "No new inventory since last import. Skip import? [Y/n]: ", "Y")
+		if err != nil {
+			return Settings{}, err
+		}
+		if strings.ToLower(confirm) == "n" {
+			confirm = "Y"
+		} else {
+			confirm = "SKIP"
+		}
+	} else if hasPrevious {
+		confirm, err = prompt(ctx, reader, fmt.Sprintf("Import new inventory? (+%d hosts, +%d services, +%d notifications) [Y/n]: ", delta.AddedHosts, delta.AddedServices, delta.AddedNotifications), "Y")
+		if err != nil {
+			return Settings{}, err
+		}
+	} else {
+		confirm, err = prompt(ctx, reader, "Import this configuration? [Y/n]: ", "Y")
+		if err != nil {
 			return Settings{}, err
 		}
 	}
-	settings.WebAllowIP = allowIP
-
-	settings.DatabaseDriver = prompt(reader, "Database driver [sqlite]: ", fallbackValue(stored.DatabaseDriver, "sqlite"))
-	settings.DatabaseDriver = strings.ToLower(strings.TrimSpace(settings.DatabaseDriver))
-	if settings.DatabaseDriver == "" {
-		settings.DatabaseDriver = "sqlite"
+	if strings.ToLower(confirm) == "n" {
+		confirm = "SKIP"
 	}
-	if settings.DatabaseDriver == "postgres" {
-		settings.DatabaseDSN = prompt(reader, "Postgres DSN: ", stored.DatabaseDSN)
-	} else {
+	if confirm != "SKIP" {
+		if err := saveImportSummary(summary); err != nil {
+			return Settings{}, err
+		}
+		if err := saveImportSummaryToDB(settings.DatabaseDriver, settings.DatabaseDSN, summary); err != nil {
+			fmt.Fprintf(os.Stderr, "setup db import summary save failed: %v\n", err)
+		}
+	}
+
+	settings.ImportNagiosPath = path
+	if err := persistSettings(settings); err != nil {
+		return Settings{}, err
+	}
+
+	printSectionTitle("Notifications", "Optional alerts via Telegram.")
+	if strings.TrimSpace(settings.TelegramToken) == "" {
+		response, err := prompt(ctx, reader, "Telegram bot token (leave empty to skip): ", settings.TelegramToken)
+		if err != nil {
+			return Settings{}, err
+		}
+		settings.TelegramToken = response
+		if err := persistSettings(settings); err != nil {
+			return Settings{}, err
+		}
+	}
+	if settings.TelegramToken != "" && strings.TrimSpace(settings.TelegramChatID) == "" {
+		response, err := prompt(ctx, reader, "Telegram chat ID: ", settings.TelegramChatID)
+		if err != nil {
+			return Settings{}, err
+		}
+		settings.TelegramChatID = response
+		if err := persistSettings(settings); err != nil {
+			return Settings{}, err
+		}
+	}
+
+	printSectionTitle("Web", "Configure the HTTP interface and access rules.")
+	if strings.TrimSpace(settings.WebAddress) == "" {
+		response, err := prompt(ctx, reader, fmt.Sprintf("Web port [%s]: ", defaultPort), defaultPort)
+		if err != nil {
+			return Settings{}, err
+		}
+		settings.WebAddress = normalizeAddress(response)
+		if err := persistSettings(settings); err != nil {
+			return Settings{}, err
+		}
+	}
+
+	if len(settings.WebAllowIPs) == 0 {
+		allowIP, err := prompt(ctx, reader, "Allowed IPs for web access (comma or space separated, leave empty to skip): ", "")
+		if err != nil {
+			return Settings{}, err
+		}
+		settings.WebAllowIPs = parseCSVList(allowIP)
+		if err := persistSettings(settings); err != nil {
+			return Settings{}, err
+		}
+	}
+	if len(settings.WebAllowIPs) > 0 {
+		if err := applyIptables(ctx, settings.WebAddress, settings.WebAllowIPs); err != nil {
+			return Settings{}, err
+		}
+	}
+
+	if settings.DatabaseDriver == "sqlite" && strings.TrimSpace(settings.DatabaseDSN) == "" {
 		settings.DatabaseDSN = defaultSQLitePath(settings.WebAddress)
 		fmt.Printf("SQLite database path: %s\n", settings.DatabaseDSN)
+		if err := persistSettings(settings); err != nil {
+			return Settings{}, err
+		}
+	}
+
+	printSectionTitle("TLS", "Optional HTTPS with automatic TLS certificates managed by the app.")
+	if strings.TrimSpace(settings.DomainName) == "" {
+		response, err := prompt(ctx, reader, "Domain for HTTPS certificates (leave empty to skip): ", "")
+		if err != nil {
+			return Settings{}, err
+		}
+		settings.DomainName = strings.TrimSpace(response)
+		if err := persistSettings(settings); err != nil {
+			return Settings{}, err
+		}
+	}
+	if settings.DomainName != "" && strings.TrimSpace(settings.SSLEmail) == "" {
+		response, err := prompt(ctx, reader, "Email for TLS certificate alerts: ", settings.SSLEmail)
+		if err != nil {
+			return Settings{}, err
+		}
+		settings.SSLEmail = strings.TrimSpace(response)
+		if err := persistSettings(settings); err != nil {
+			return Settings{}, err
+		}
+	}
+	if settings.DomainName != "" {
+		if err := ensureLetsEncrypt(ctx, settings.DomainName, settings.SSLEmail); err != nil {
+			return Settings{}, err
+		}
+		if strings.TrimSpace(settings.WebAddress) == "" || settings.WebAddress == ":80" {
+			settings.WebAddress = ":443"
+			if err := persistSettings(settings); err != nil {
+				return Settings{}, err
+			}
+		}
 	}
 
 	if err := configureSSHKeys(ctx, reader, settings); err != nil {
@@ -115,16 +294,32 @@ func Run(ctx context.Context) (Settings, error) {
 	return settings, nil
 }
 
+// persistSettings stores each input in the database so setup can resume without retyping.
+func persistSettings(settings Settings) error {
+	// We skip DB writes until the storage configuration is known.
+	if settings.DatabaseDriver == "" || settings.DatabaseDSN == "" {
+		return nil
+	}
+	return saveSettingsToDB(settings)
+}
+
 // ---- Prompt helpers ----
 
-func prompt(reader *bufio.Reader, label, fallback string) string {
+func prompt(ctx context.Context, reader *bufio.Reader, label, fallback string) (string, error) {
+	// Keep prompts cancellable so Ctrl+C stops setup cleanly.
 	fmt.Print(label)
-	text, _ := reader.ReadString('\n')
+	text, err := reader.ReadString('\n')
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", err
+	}
 	text = strings.TrimSpace(text)
 	if text == "" {
-		return fallback
+		return fallback, nil
 	}
-	return text
+	return text, nil
 }
 
 func fallbackValue(value, fallback string) string {
@@ -143,24 +338,77 @@ func normalizeAddress(port string) string {
 }
 
 func defaultSQLitePath(address string) string {
-	port := strings.TrimPrefix(address, ":")
-	path := filepath.Join("/var/lib/chicha-pulse", fmt.Sprintf("database-%s.sqlite", port))
+	path := filepath.Join("/var/lib/chicha-pulse", "database.sqlite")
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
 	return "file:" + path
 }
 
-func applyIptables(ctx context.Context, address, ip string) error {
+func applyIptables(ctx context.Context, address string, allowIPs []string) error {
+	// Apply allow-list rules first, then drop everything else on the web port.
 	port, err := portFromAddress(address)
 	if err != nil {
 		return err
 	}
-	allow := exec.CommandContext(ctx, "iptables", "-A", "INPUT", "-p", "tcp", "--dport", port, "-s", ip, "-j", "ACCEPT")
-	if output, err := allow.CombinedOutput(); err != nil {
-		return fmt.Errorf("iptables allow failed: %s", strings.TrimSpace(string(output)))
+	for _, ip := range allowIPs {
+		if strings.TrimSpace(ip) == "" {
+			continue
+		}
+		if err := addIptablesRule(ctx, port, ip, "ACCEPT"); err != nil {
+			return err
+		}
 	}
-	deny := exec.CommandContext(ctx, "iptables", "-A", "INPUT", "-p", "tcp", "--dport", port, "-j", "DROP")
-	if output, err := deny.CombinedOutput(); err != nil {
-		return fmt.Errorf("iptables deny failed: %s", strings.TrimSpace(string(output)))
+	return addIptablesRule(ctx, port, "", "DROP")
+}
+
+func EnsureIptables(ctx context.Context, address string, allowIPs []string) error {
+	// Re-apply allow-list rules on restart so the port stays protected.
+	port, err := portFromAddress(address)
+	if err != nil {
+		return err
+	}
+	for _, ip := range allowIPs {
+		clean := strings.TrimSpace(ip)
+		if clean == "" {
+			continue
+		}
+		if !iptablesRuleExists(ctx, port, clean, "ACCEPT") {
+			if err := addIptablesRule(ctx, port, clean, "ACCEPT"); err != nil {
+				return err
+			}
+		}
+	}
+	if len(allowIPs) > 0 && !iptablesRuleExists(ctx, port, "", "DROP") {
+		if err := addIptablesRule(ctx, port, "", "DROP"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func iptablesRuleExists(ctx context.Context, port string, ip string, action string) bool {
+	// Query iptables before adding to avoid duplicate rules.
+	args := []string{"-C", "INPUT", "-p", "tcp", "--dport", port}
+	if ip != "" {
+		args = append(args, "-s", ip)
+	}
+	args = append(args, "-j", action)
+	cmd := exec.CommandContext(ctx, "iptables", args...)
+	if err := cmd.Run(); err != nil {
+		return false
+	}
+	return true
+}
+
+func addIptablesRule(ctx context.Context, port string, ip string, action string) error {
+	// Add a specific iptables rule with clear error reporting.
+	args := []string{"-A", "INPUT", "-p", "tcp", "--dport", port}
+	if ip != "" {
+		args = append(args, "-s", ip)
+	}
+	args = append(args, "-j", action)
+	cmd := exec.CommandContext(ctx, "iptables", args...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("iptables %s failed: %s", strings.ToLower(action), strings.TrimSpace(string(output)))
 	}
 	return nil
 }
@@ -185,6 +433,75 @@ func printBanner() {
 	fmt.Println(purple + "══════════════════════════════════════" + reset)
 }
 
+func printSectionTitle(title string, hint string) {
+	// Use color to separate wizard sections for clarity.
+	cyan := "\033[36m"
+	green := "\033[32m"
+	reset := "\033[0m"
+	fmt.Printf("\n%s[%s]%s %s\n", cyan, title, reset, hint)
+	fmt.Printf("%s──────────────────────────────────────%s\n", green, reset)
+}
+
+func printExistingSettings(settings Settings) {
+	// Show current settings so operators can keep what already works.
+	fmt.Println("\nCurrent settings (press Enter to keep defaults):")
+	if settings.ImportNagiosPath != "" {
+		fmt.Printf("- Nagios config: %s\n", settings.ImportNagiosPath)
+	}
+	if settings.WebAddress != "" {
+		fmt.Printf("- Web address: %s\n", settings.WebAddress)
+	}
+	if len(settings.WebAllowIPs) > 0 {
+		fmt.Printf("- Web allow IPs: %s\n", strings.Join(settings.WebAllowIPs, ", "))
+	}
+	if settings.TelegramToken != "" {
+		fmt.Printf("- Telegram token: %s\n", redactToken(settings.TelegramToken))
+	}
+	if settings.TelegramChatID != "" {
+		fmt.Printf("- Telegram chat ID: %s\n", settings.TelegramChatID)
+	}
+	if settings.DatabaseDriver != "" {
+		fmt.Printf("- Database driver: %s\n", settings.DatabaseDriver)
+	}
+	if settings.DatabaseDSN != "" {
+		fmt.Printf("- Database DSN: %s\n", redactDSN(settings.DatabaseDSN))
+	}
+	if settings.DomainName != "" {
+		fmt.Printf("- TLS domain: %s\n", settings.DomainName)
+	}
+}
+
+func redactToken(token string) string {
+	// Hide most of the token to avoid leaking secrets in the setup output.
+	trimmed := strings.TrimSpace(token)
+	if len(trimmed) <= 6 {
+		return "***"
+	}
+	return trimmed[:3] + "***" + trimmed[len(trimmed)-3:]
+}
+
+type importDelta struct {
+	AddedHosts         int
+	AddedServices      int
+	AddedNotifications int
+	HasNoNew           bool
+}
+
+func parseCSVList(input string) []string {
+	// Split on commas and whitespace so admins can paste lists quickly.
+	fields := strings.FieldsFunc(input, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n'
+	})
+	var values []string
+	for _, field := range fields {
+		clean := strings.TrimSpace(field)
+		if clean != "" {
+			values = append(values, clean)
+		}
+	}
+	return values
+}
+
 // ---- SSH key setup ----
 
 func configureSSHKeys(ctx context.Context, reader *bufio.Reader, settings Settings) error {
@@ -195,13 +512,20 @@ func configureSSHKeys(ctx context.Context, reader *bufio.Reader, settings Settin
 		fmt.Println("SSH key setup skipped: database not configured.")
 		return nil
 	}
+	if records, err := sshkeys.LoadKeyringFromSettings(ctx); err == nil && len(records) > 0 {
+		fmt.Println("SSH key setup skipped: existing keys found.")
+		return nil
+	}
 	if err := tightenSQLitePermissions(settings.DatabaseDriver, settings.DatabaseDSN); err != nil {
 		fmt.Fprintf(os.Stderr, "setup: sqlite permissions warning: %v\n", err)
 	}
 
 	fmt.Println("\nSSH key setup (up to 3 keys):")
 	for index := 1; index <= 3; index++ {
-		choice := prompt(reader, fmt.Sprintf("Key %d: enter private key path, 'g' to generate, or leave empty to skip: ", index), "")
+		choice, err := prompt(ctx, reader, fmt.Sprintf("Key %d: enter private key path, 'g' to generate, 'p' to paste, or leave empty to skip: ", index), "")
+		if err != nil {
+			return err
+		}
 		if strings.TrimSpace(choice) == "" {
 			return nil
 		}
@@ -216,8 +540,36 @@ func configureSSHKeys(ctx context.Context, reader *bufio.Reader, settings Settin
 			if err := saveSSHKey(ctx, settings, generated, passphrase, publicKey); err != nil {
 				return err
 			}
+		} else if strings.EqualFold(keyPath, "p") {
+			passphrase, err := promptPassphrase(ctx, reader, "Passphrase for this key (leave empty to keep none, or type 'g' to generate): ")
+			if err != nil {
+				return err
+			}
+			if strings.EqualFold(passphrase, "g") {
+				generatedPassphrase, err := randomPassphrase()
+				if err != nil {
+					return err
+				}
+				passphrase = generatedPassphrase
+				fmt.Printf("Generated passphrase: %s\n", passphrase)
+			}
+			label, privateKey, err := promptPrivateKeyPaste(ctx, reader)
+			if err != nil {
+				return err
+			}
+			publicKey, err := derivePublicKey(ctx, privateKey)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Public key:\n%s\n", publicKey)
+			if err := saveSSHKeyData(ctx, settings, label, privateKey, passphrase, publicKey); err != nil {
+				return err
+			}
 		} else {
-			passphrase := promptPassphrase(reader, "Passphrase for this key (leave empty to keep none, or type 'g' to generate): ")
+			passphrase, err := promptPassphrase(ctx, reader, "Passphrase for this key (leave empty to keep none, or type 'g' to generate): ")
+			if err != nil {
+				return err
+			}
 			if strings.EqualFold(passphrase, "g") {
 				generatedPassphrase, err := randomPassphrase()
 				if err != nil {
@@ -235,7 +587,10 @@ func configureSSHKeys(ctx context.Context, reader *bufio.Reader, settings Settin
 				return err
 			}
 		}
-		next := prompt(reader, "Add another SSH key? [y/N]: ", "N")
+		next, err := prompt(ctx, reader, "Add another SSH key? [y/N]: ", "N")
+		if err != nil {
+			return err
+		}
 		if strings.ToLower(next) != "y" {
 			return nil
 		}
@@ -250,6 +605,15 @@ func saveSSHKey(ctx context.Context, settings Settings, path, passphrase, public
 	}
 	label := filepath.Base(path)
 	return sshkeys.SaveKey(ctx, settings.DatabaseDriver, settings.DatabaseDSN, label, publicKey, privateKey, []byte(passphrase))
+}
+
+func saveSSHKeyData(ctx context.Context, settings Settings, label string, privateKey []byte, passphrase, publicKey string) error {
+	// Save pasted keys with a label so the keyring can reference the source later.
+	cleanLabel := strings.TrimSpace(label)
+	if cleanLabel == "" {
+		cleanLabel = fmt.Sprintf("pasted-%d", time.Now().Unix())
+	}
+	return sshkeys.SaveKey(ctx, settings.DatabaseDriver, settings.DatabaseDSN, cleanLabel, publicKey, privateKey, []byte(passphrase))
 }
 
 func generateSSHKey() (string, string, string, error) {
@@ -289,10 +653,59 @@ func readPublicKey(ctx context.Context, path string) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
-func promptPassphrase(reader *bufio.Reader, label string) string {
+func derivePublicKey(ctx context.Context, privateKey []byte) (string, error) {
+	// Write pasted keys to a temp file so ssh-keygen can derive the public key.
+	dir := "/var/lib/chicha-pulse/ssh"
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, fmt.Sprintf("pasted_%d", time.Now().UnixNano()))
+	if err := os.WriteFile(path, privateKey, 0o600); err != nil {
+		return "", err
+	}
+	defer os.Remove(path)
+	return readPublicKey(ctx, path)
+}
+
+func promptPrivateKeyPaste(ctx context.Context, reader *bufio.Reader) (string, []byte, error) {
+	// Accept multi-line pasted keys so operators can avoid storing files ahead of time.
+	fmt.Println("Paste private key contents, then finish with a single line containing END:")
+	label, err := prompt(ctx, reader, "Label for this key (optional): ", "")
+	if err != nil {
+		return "", nil, err
+	}
+	var lines []string
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if ctx.Err() != nil {
+				return "", nil, ctx.Err()
+			}
+			return "", nil, err
+		}
+		text := strings.TrimRight(line, "\r\n")
+		if strings.TrimSpace(text) == "END" {
+			break
+		}
+		lines = append(lines, text)
+	}
+	if len(lines) == 0 {
+		return "", nil, fmt.Errorf("no key data provided")
+	}
+	return label, []byte(strings.Join(lines, "\n") + "\n"), nil
+}
+
+func promptPassphrase(ctx context.Context, reader *bufio.Reader, label string) (string, error) {
+	// Read passphrases with cancellation support.
 	fmt.Print(label)
-	text, _ := reader.ReadString('\n')
-	return strings.TrimSpace(text)
+	text, err := reader.ReadString('\n')
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", err
+	}
+	return strings.TrimSpace(text), nil
 }
 
 func randomPassphrase() (string, error) {
@@ -336,20 +749,31 @@ func settingsPath() string {
 	return "/var/lib/chicha-pulse/settings.conf"
 }
 
+func importSummaryPath() string {
+	// Keep import metadata alongside settings for easy inspection.
+	return "/var/lib/chicha-pulse/import_summary.json"
+}
+
 func loadSettings() (Settings, error) {
 	data, err := os.ReadFile(settingsPath())
 	if err != nil {
 		return Settings{}, err
 	}
 	parsed := parseKeyValues(string(data))
+	allowIPs := parseCSVList(parsed["web_allow_ips"])
+	if len(allowIPs) == 0 {
+		allowIPs = parseCSVList(parsed["web_allow_ip"])
+	}
 	return Settings{
 		ImportNagiosPath: parsed["import_nagios"],
 		WebAddress:       parsed["web_addr"],
-		WebAllowIP:       parsed["web_allow_ip"],
+		WebAllowIPs:      allowIPs,
 		TelegramToken:    parsed["telegram_token"],
 		TelegramChatID:   parsed["telegram_chat_id"],
 		DatabaseDriver:   parsed["db_driver"],
 		DatabaseDSN:      parsed["db_dsn"],
+		DomainName:       parsed["domain_name"],
+		SSLEmail:         parsed["ssl_email"],
 	}, nil
 }
 
@@ -375,11 +799,13 @@ func saveSettings(settings Settings) error {
 	content := strings.Join([]string{
 		"import_nagios=" + settings.ImportNagiosPath,
 		"web_addr=" + settings.WebAddress,
-		"web_allow_ip=" + settings.WebAllowIP,
+		"web_allow_ips=" + strings.Join(settings.WebAllowIPs, ","),
 		"telegram_token=" + settings.TelegramToken,
 		"telegram_chat_id=" + settings.TelegramChatID,
 		"db_driver=" + settings.DatabaseDriver,
 		"db_dsn=" + settings.DatabaseDSN,
+		"domain_name=" + settings.DomainName,
+		"ssl_email=" + settings.SSLEmail,
 	}, "\n")
 	if err := saveSettingsToDB(settings); err != nil {
 		fmt.Fprintf(os.Stderr, "setup db save failed: %v\n", err)
@@ -412,8 +838,8 @@ func mergeSettings(base, override Settings) Settings {
 	if strings.TrimSpace(override.WebAddress) != "" {
 		merged.WebAddress = override.WebAddress
 	}
-	if strings.TrimSpace(override.WebAllowIP) != "" {
-		merged.WebAllowIP = override.WebAllowIP
+	if len(override.WebAllowIPs) > 0 {
+		merged.WebAllowIPs = append([]string(nil), override.WebAllowIPs...)
 	}
 	if strings.TrimSpace(override.TelegramToken) != "" {
 		merged.TelegramToken = override.TelegramToken
@@ -427,7 +853,133 @@ func mergeSettings(base, override Settings) Settings {
 	if strings.TrimSpace(override.DatabaseDSN) != "" {
 		merged.DatabaseDSN = override.DatabaseDSN
 	}
+	if strings.TrimSpace(override.DomainName) != "" {
+		merged.DomainName = override.DomainName
+	}
+	if strings.TrimSpace(override.SSLEmail) != "" {
+		merged.SSLEmail = override.SSLEmail
+	}
 	return merged
+}
+
+func loadImportSummary() (Summary, bool, error) {
+	// Load the last import summary so setup can detect new inventory.
+	data, err := os.ReadFile(importSummaryPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return Summary{}, false, nil
+		}
+		return Summary{}, false, err
+	}
+	var summary Summary
+	if err := json.Unmarshal(data, &summary); err != nil {
+		return Summary{}, false, err
+	}
+	return summary, true, nil
+}
+
+func saveImportSummary(summary Summary) error {
+	// Persist the summary so later runs can compute deltas.
+	if err := os.MkdirAll(filepath.Dir(importSummaryPath()), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(summary, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(importSummaryPath(), data, 0o600)
+}
+
+func loadImportSummaryFromDB(driverName, dsn string) (Summary, bool, error) {
+	// Read the last import summary from the database for quick stats.
+	db, err := sql.Open(driverName, dsn)
+	if err != nil {
+		return Summary{}, false, err
+	}
+	defer db.Close()
+	statement := `SELECT hosts, services, notifications, config_path
+FROM setup_import_summary ORDER BY created_at DESC LIMIT 1`
+	row := db.QueryRow(statement)
+	var summary Summary
+	if err := row.Scan(&summary.Hosts, &summary.Services, &summary.Notifications, &summary.ConfigFileHint); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Summary{}, false, nil
+		}
+		return Summary{}, false, err
+	}
+	return summary, true, nil
+}
+
+func saveImportSummaryToDB(driverName, dsn string, summary Summary) error {
+	// Keep the last import summary in the database for future setup runs.
+	if driverName == "" || dsn == "" {
+		return nil
+	}
+	db, err := sql.Open(driverName, dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	schema := `CREATE TABLE IF NOT EXISTS setup_import_summary (
+id TEXT,
+hosts INTEGER,
+services INTEGER,
+notifications INTEGER,
+config_path TEXT,
+created_at TEXT
+)`
+	if _, err := db.Exec(schema); err != nil {
+		return err
+	}
+	statement := fmt.Sprintf(`INSERT INTO setup_import_summary (
+id, hosts, services, notifications, config_path, created_at
+) VALUES (%s, %s, %s, %s, %s, %s)`,
+		placeholder(driverName, 1),
+		placeholder(driverName, 2),
+		placeholder(driverName, 3),
+		placeholder(driverName, 4),
+		placeholder(driverName, 5),
+		placeholder(driverName, 6),
+	)
+	_, err = db.Exec(statement,
+		fmt.Sprintf("%d", time.Now().UnixNano()),
+		summary.Hosts,
+		summary.Services,
+		summary.Notifications,
+		summary.ConfigFileHint,
+		time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	return err
+}
+
+func buildImportDelta(current Summary, previous Summary, hasPrevious bool) importDelta {
+	// Track added inventory so setup can avoid unnecessary re-import prompts.
+	if !hasPrevious || previous.ConfigFileHint != current.ConfigFileHint {
+		return importDelta{
+			AddedHosts:         current.Hosts,
+			AddedServices:      current.Services,
+			AddedNotifications: current.Notifications,
+			HasNoNew:           false,
+		}
+	}
+	addedHosts := current.Hosts - previous.Hosts
+	if addedHosts < 0 {
+		addedHosts = 0
+	}
+	addedServices := current.Services - previous.Services
+	if addedServices < 0 {
+		addedServices = 0
+	}
+	addedNotifications := current.Notifications - previous.Notifications
+	if addedNotifications < 0 {
+		addedNotifications = 0
+	}
+	return importDelta{
+		AddedHosts:         addedHosts,
+		AddedServices:      addedServices,
+		AddedNotifications: addedNotifications,
+		HasNoNew:           addedHosts == 0 && addedServices == 0 && addedNotifications == 0,
+	}
 }
 
 func loadSettingsFromDB(driverName, dsn string) (Settings, error) {
@@ -437,14 +989,42 @@ func loadSettingsFromDB(driverName, dsn string) (Settings, error) {
 	}
 	defer db.Close()
 
+	statement := `SELECT import_nagios, web_addr, web_allow_ips, telegram_token, telegram_chat_id, db_driver, db_dsn, domain_name, ssl_email
+FROM setup_settings ORDER BY updated_at DESC LIMIT 1`
+	row := db.QueryRow(statement)
+	settings := Settings{}
+	var allowIPs string
+	if err := row.Scan(
+		&settings.ImportNagiosPath,
+		&settings.WebAddress,
+		&allowIPs,
+		&settings.TelegramToken,
+		&settings.TelegramChatID,
+		&settings.DatabaseDriver,
+		&settings.DatabaseDSN,
+		&settings.DomainName,
+		&settings.SSLEmail,
+	); err != nil {
+		if isSchemaColumnMissing(err) {
+			return loadSettingsFromDBLegacy(db)
+		}
+		return Settings{}, err
+	}
+	settings.WebAllowIPs = parseCSVList(allowIPs)
+	return settings, nil
+}
+
+func loadSettingsFromDBLegacy(db *sql.DB) (Settings, error) {
+	// Fall back to older schema so upgrades keep existing values.
 	statement := `SELECT import_nagios, web_addr, web_allow_ip, telegram_token, telegram_chat_id, db_driver, db_dsn
 FROM setup_settings ORDER BY updated_at DESC LIMIT 1`
 	row := db.QueryRow(statement)
 	settings := Settings{}
+	var allowIP string
 	if err := row.Scan(
 		&settings.ImportNagiosPath,
 		&settings.WebAddress,
-		&settings.WebAllowIP,
+		&allowIP,
 		&settings.TelegramToken,
 		&settings.TelegramChatID,
 		&settings.DatabaseDriver,
@@ -452,7 +1032,14 @@ FROM setup_settings ORDER BY updated_at DESC LIMIT 1`
 	); err != nil {
 		return Settings{}, err
 	}
+	settings.WebAllowIPs = parseCSVList(allowIP)
 	return settings, nil
+}
+
+func isSchemaColumnMissing(err error) bool {
+	// Match common column-missing errors across drivers without vendor specifics.
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "no such column") || strings.Contains(message, "column") && strings.Contains(message, "does not exist")
 }
 
 func saveSettingsToDB(settings Settings) error {
@@ -469,19 +1056,24 @@ func saveSettingsToDB(settings Settings) error {
 id TEXT,
 import_nagios TEXT,
 web_addr TEXT,
-web_allow_ip TEXT,
+web_allow_ips TEXT,
 telegram_token TEXT,
 telegram_chat_id TEXT,
 db_driver TEXT,
 db_dsn TEXT,
+domain_name TEXT,
+ssl_email TEXT,
 updated_at TEXT
 )`
 	if _, err := db.Exec(schema); err != nil {
 		return err
 	}
+	if err := ensureSetupSettingsColumns(db); err != nil {
+		return err
+	}
 	statement := fmt.Sprintf(`INSERT INTO setup_settings (
-id, import_nagios, web_addr, web_allow_ip, telegram_token, telegram_chat_id, db_driver, db_dsn, updated_at
-) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)`,
+id, import_nagios, web_addr, web_allow_ips, telegram_token, telegram_chat_id, db_driver, db_dsn, domain_name, ssl_email, updated_at
+) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)`,
 		placeholder(settings.DatabaseDriver, 1),
 		placeholder(settings.DatabaseDriver, 2),
 		placeholder(settings.DatabaseDriver, 3),
@@ -491,19 +1083,45 @@ id, import_nagios, web_addr, web_allow_ip, telegram_token, telegram_chat_id, db_
 		placeholder(settings.DatabaseDriver, 7),
 		placeholder(settings.DatabaseDriver, 8),
 		placeholder(settings.DatabaseDriver, 9),
+		placeholder(settings.DatabaseDriver, 10),
+		placeholder(settings.DatabaseDriver, 11),
 	)
 	_, err = db.Exec(statement,
 		fmt.Sprintf("%d", time.Now().UnixNano()),
 		settings.ImportNagiosPath,
 		settings.WebAddress,
-		settings.WebAllowIP,
+		strings.Join(settings.WebAllowIPs, ","),
 		settings.TelegramToken,
 		settings.TelegramChatID,
 		settings.DatabaseDriver,
 		settings.DatabaseDSN,
+		settings.DomainName,
+		settings.SSLEmail,
 		time.Now().UTC().Format(time.RFC3339Nano),
 	)
 	return err
+}
+
+func ensureSetupSettingsColumns(db *sql.DB) error {
+	// Best-effort schema upgrades keep existing installs working.
+	for _, statement := range []string{
+		"ALTER TABLE setup_settings ADD COLUMN web_allow_ips TEXT",
+		"ALTER TABLE setup_settings ADD COLUMN domain_name TEXT",
+		"ALTER TABLE setup_settings ADD COLUMN ssl_email TEXT",
+	} {
+		if _, err := db.Exec(statement); err != nil && !isAlterColumnIgnored(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func isAlterColumnIgnored(err error) bool {
+	// Ignore errors for columns that already exist across common SQL engines.
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "duplicate column") ||
+		strings.Contains(message, "already exists") ||
+		strings.Contains(message, "duplicate") && strings.Contains(message, "column")
 }
 
 func placeholder(driverName string, index int) string {
@@ -540,6 +1158,23 @@ func sendTelegramTest(ctx context.Context, settings Settings) error {
 	return nil
 }
 
+func ensureLetsEncrypt(ctx context.Context, domain string, email string) error {
+	// Generate certificates with Go so setup does not depend on external tooling.
+	if strings.TrimSpace(domain) == "" {
+		return nil
+	}
+	if strings.TrimSpace(email) == "" {
+		return fmt.Errorf("ssl email is required for TLS certificates")
+	}
+	if _, err := tlsmanager.Ensure(ctx, tlsmanager.Config{
+		Domain: domain,
+		Email:  email,
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
 func telegramEndpoint(token string) string {
 	return fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
 }
@@ -551,10 +1186,13 @@ func buildSetupMessage(settings Settings) string {
 		fmt.Sprintf("Web: %s", settings.WebAddress),
 		fmt.Sprintf("Database: %s (%s)", settings.DatabaseDriver, redactDSN(settings.DatabaseDSN)),
 	}
-	if settings.WebAllowIP != "" {
-		lines = append(lines, fmt.Sprintf("Web access: locked to %s via iptables", settings.WebAllowIP))
+	if len(settings.WebAllowIPs) > 0 {
+		lines = append(lines, fmt.Sprintf("Web access: locked to %s via iptables", strings.Join(settings.WebAllowIPs, ", ")))
 	} else {
 		lines = append(lines, "Web access: open (no iptables lock)")
+	}
+	if settings.DomainName != "" {
+		lines = append(lines, fmt.Sprintf("TLS domain: %s", settings.DomainName))
 	}
 	ips := listLocalIPs()
 	if len(ips) > 0 {
@@ -618,14 +1256,17 @@ func extractIP(addr net.Addr) string {
 func printAccessSummary(settings Settings) {
 	fmt.Println("\nAccess summary:")
 	fmt.Printf("- Web address: %s\n", settings.WebAddress)
-	if settings.WebAllowIP != "" {
-		fmt.Printf("- Web access locked to: %s\n", settings.WebAllowIP)
+	if len(settings.WebAllowIPs) > 0 {
+		fmt.Printf("- Web access locked to: %s\n", strings.Join(settings.WebAllowIPs, ", "))
 	} else {
 		fmt.Println("- Web access: open (no iptables lock)")
 	}
 	ips := listLocalIPs()
 	if len(ips) > 0 {
 		fmt.Printf("- Local IPs: %s\n", strings.Join(ips, ", "))
+	}
+	if settings.DomainName != "" {
+		fmt.Printf("- TLS domain: %s\n", settings.DomainName)
 	}
 }
 

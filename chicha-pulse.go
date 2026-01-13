@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -20,6 +22,7 @@ import (
 	"chicha-pulse/pkg/setup"
 	"chicha-pulse/pkg/storage"
 	"chicha-pulse/pkg/store"
+	"chicha-pulse/pkg/tlsmanager"
 	"chicha-pulse/pkg/web"
 
 	_ "chicha-pulse/pkg/localsql"
@@ -38,6 +41,9 @@ type Configuration struct {
 	TelegramChatID   string
 	DatabaseDriver   string
 	DatabaseDSN      string
+	DomainName       string
+	SSLEmail         string
+	WebAllowIPs      []string
 	SetupMode        bool
 }
 
@@ -50,6 +56,10 @@ func main() {
 	if config.SetupMode {
 		settings, err := setup.Run(ctx)
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				log.Printf("setup cancelled")
+				return
+			}
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -64,6 +74,13 @@ func main() {
 	if err := validateConfig(config); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
+	}
+
+	if len(config.WebAllowIPs) > 0 {
+		if err := setup.EnsureIptables(ctx, config.WebAddress, config.WebAllowIPs); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	}
 
 	st := store.New(ctx)
@@ -106,7 +123,7 @@ func main() {
 		log.Printf("failed to store web credentials: %v", err)
 	}
 
-	srv, err := web.NewServer(st, auth, config.PageTitle)
+	srv, err := web.NewServer(st, auth, config.PageTitle, config.WebAllowIPs)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -115,6 +132,14 @@ func main() {
 	httpServer := &http.Server{
 		Addr:    config.WebAddress,
 		Handler: srv.Handler(),
+	}
+
+	if config.DomainName != "" {
+		if err := runTLS(ctx, httpServer, config.DomainName, config.SSLEmail); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	if err := web.Run(ctx, httpServer); err != nil {
@@ -172,6 +197,12 @@ func applySettings(config Configuration, settings setup.Settings) Configuration 
 	config.TelegramChatID = settings.TelegramChatID
 	config.DatabaseDriver = settings.DatabaseDriver
 	config.DatabaseDSN = settings.DatabaseDSN
+	config.DomainName = settings.DomainName
+	config.SSLEmail = settings.SSLEmail
+	config.WebAllowIPs = append([]string(nil), settings.WebAllowIPs...)
+	if config.DomainName != "" {
+		config.WebAddress = ":443"
+	}
 	return config
 }
 
@@ -300,4 +331,58 @@ func closeDatabase(database *storage.Store) {
 	if err := database.Close(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 	}
+}
+
+func runTLS(ctx context.Context, server *http.Server, domain string, email string) error {
+	// Serve HTTPS with a redirect server on port 80 for convenience.
+	// We generate or refresh certificates here so runtime TLS always has material to load.
+	paths, err := tlsmanager.Ensure(ctx, tlsmanager.Config{Domain: domain, Email: email})
+	if err != nil {
+		return err
+	}
+	// Renewal runs on a daily cadence so certificates stay fresh.
+	renewErrs := tlsmanager.StartRenewal(ctx, tlsmanager.Config{Domain: domain, Email: email}, 24*time.Hour)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case err := <-renewErrs:
+				if err != nil {
+					log.Printf("tls renewal failed: %v", err)
+				}
+			}
+		}
+	}()
+	// The broker keeps TLS reloading serialized without mutexes.
+	broker := tlsmanager.NewBroker(ctx, paths, time.Minute)
+	server.TLSConfig = &tls.Config{
+		GetCertificate: broker.GetCertificate,
+	}
+	redirectServer := &http.Server{
+		Addr: ":80",
+		Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			target := "https://" + domain + request.URL.RequestURI()
+			http.Redirect(writer, request, target, http.StatusMovedPermanently)
+		}),
+	}
+	go func() {
+		if err := web.Run(ctx, redirectServer); err != nil {
+			log.Printf("redirect server stopped: %v", err)
+		}
+	}()
+	return runTLSWithContext(ctx, server)
+}
+
+func runTLSWithContext(ctx context.Context, server *http.Server) error {
+	// Respect context cancellation while serving TLS.
+	shutdownErr := make(chan error, 1)
+	go func() {
+		<-ctx.Done()
+		shutdownErr <- server.Shutdown(context.Background())
+	}()
+	if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return <-shutdownErr
 }

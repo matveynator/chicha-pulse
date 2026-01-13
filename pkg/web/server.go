@@ -3,8 +3,10 @@ package web
 import (
 	"context"
 	"html/template"
+	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,10 +30,11 @@ type Server struct {
 	auth      AuthConfig
 	template  *template.Template
 	pageTitle string
+	allowIPs  []string
 }
 
 // NewServer prepares the HTTP handler so the caller can run it with a standard net/http server.
-func NewServer(st *store.Store, auth AuthConfig, pageTitle string) (*Server, error) {
+func NewServer(st *store.Store, auth AuthConfig, pageTitle string, allowIPs []string) (*Server, error) {
 	page := template.Must(template.New("index").Funcs(template.FuncMap{
 		"statusBadge": statusBadge,
 	}).Parse(indexTemplate))
@@ -40,6 +43,7 @@ func NewServer(st *store.Store, auth AuthConfig, pageTitle string) (*Server, err
 		auth:      auth,
 		template:  page,
 		pageTitle: pageTitle,
+		allowIPs:  append([]string(nil), allowIPs...),
 	}, nil
 }
 
@@ -103,6 +107,10 @@ func (srv *Server) handleAssignGroup(writer http.ResponseWriter, request *http.R
 
 func (srv *Server) basicAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !srv.isAllowedIP(request) {
+			http.Error(writer, "forbidden", http.StatusForbidden)
+			return
+		}
 		user, pass, ok := request.BasicAuth()
 		if !ok || user != srv.auth.Username || pass != srv.auth.Password {
 			writer.Header().Set("WWW-Authenticate", "Basic realm=\"chicha-pulse\"")
@@ -111,6 +119,38 @@ func (srv *Server) basicAuth(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(writer, request)
 	})
+}
+
+func (srv *Server) isAllowedIP(request *http.Request) bool {
+	// Enforce allow-lists so only trusted IPs reach the UI.
+	if len(srv.allowIPs) == 0 {
+		return true
+	}
+	host, _, err := net.SplitHostPort(request.RemoteAddr)
+	if err != nil {
+		host = request.RemoteAddr
+	}
+	ip := net.ParseIP(strings.TrimSpace(host))
+	if ip == nil {
+		return false
+	}
+	for _, entry := range srv.allowIPs {
+		clean := strings.TrimSpace(entry)
+		if clean == "" {
+			continue
+		}
+		if strings.Contains(clean, "/") {
+			_, block, err := net.ParseCIDR(clean)
+			if err == nil && block.Contains(ip) {
+				return true
+			}
+			continue
+		}
+		if ip.Equal(net.ParseIP(clean)) {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- View models ----
@@ -266,7 +306,7 @@ func buildHostView(host *model.Host, parents map[string][]*model.Host, inventory
 		label, class := statusLabelFromStatus(status, ok)
 		services = append(services, serviceView{
 			Name:        service.Name,
-			Command:     service.CheckCommand,
+			Command:     displayServiceCommand(host, service),
 			Notes:       service.Notes,
 			Interval:    service.CheckIntervalMinutes,
 			SSHUser:     service.SSHUser,
@@ -390,6 +430,90 @@ func formatTime(value time.Time) string {
 		return ""
 	}
 	return value.Format(time.RFC3339)
+}
+
+func displayServiceCommand(host *model.Host, service model.Service) string {
+	// Prefer showing the native ssh command so operators see the real connection shape.
+	if command, ok := legacySSHDisplayCommand(service.CheckCommand); ok {
+		return command
+	}
+	if command := buildSSHCommandDisplay(host, service); command != "" {
+		return command
+	}
+	return service.CheckCommand
+}
+
+func legacySSHDisplayCommand(command string) (string, bool) {
+	// Translate legacy check_ssh invocations into a plain ssh command for readability.
+	fields := strings.Fields(command)
+	for index, field := range fields {
+		if strings.HasSuffix(field, "check_ssh") || strings.Contains(field, "/check_ssh") {
+			if index+1 >= len(fields) {
+				return "", false
+			}
+			target := fields[index+1]
+			remoteCommand := ""
+			if index+2 < len(fields) {
+				remoteCommand = normalizeRemoteCommand(strings.Join(fields[index+2:], " "))
+			}
+			parts := []string{"ssh", target}
+			if remoteCommand != "" {
+				parts = append(parts, remoteCommand)
+			}
+			return strings.Join(parts, " "), true
+		}
+	}
+	return "", false
+}
+
+func buildSSHCommandDisplay(host *model.Host, service model.Service) string {
+	// Use the parsed SSH settings so check_by_ssh commands read as standard ssh.
+	if service.SSHCommand == "" && service.SSHUser == "" && service.SSHKeyPath == "" && service.SSHPort == 0 {
+		return ""
+	}
+	address := host.Address
+	if address == "" {
+		address = host.Name
+	}
+	if address == "" {
+		return ""
+	}
+	target := address
+	if strings.TrimSpace(service.SSHUser) != "" {
+		target = service.SSHUser + "@" + address
+	}
+	parts := []string{"ssh"}
+	if service.SSHPort != 0 {
+		parts = append(parts, "-p", strconv.Itoa(service.SSHPort))
+	}
+	if strings.TrimSpace(service.SSHKeyPath) != "" {
+		parts = append(parts, "-i", service.SSHKeyPath)
+	}
+	parts = append(parts, target)
+	if strings.TrimSpace(service.SSHCommand) != "" {
+		parts = append(parts, service.SSHCommand)
+	}
+	return strings.Join(parts, " ")
+}
+
+func normalizeRemoteCommand(command string) string {
+	// Unquote commands so the display stays readable and matches ssh expectations.
+	trimmed := strings.TrimSpace(command)
+	unescaped := strings.ReplaceAll(trimmed, "\\\"", "\"")
+	unescaped = strings.ReplaceAll(unescaped, "\\'", "'")
+	if len(unescaped) < 2 {
+		return unescaped
+	}
+	first := unescaped[0]
+	last := unescaped[len(unescaped)-1]
+	if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+		unquoted, err := strconv.Unquote(unescaped)
+		if err == nil {
+			return unquoted
+		}
+		return strings.Trim(unescaped, "\"'")
+	}
+	return unescaped
 }
 
 // ---- Templates ----

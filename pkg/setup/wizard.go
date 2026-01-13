@@ -2,13 +2,18 @@ package setup
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"chicha-pulse/pkg/model"
 	"chicha-pulse/pkg/nagiosimport"
@@ -21,6 +26,7 @@ import (
 type Settings struct {
 	ImportNagiosPath string
 	WebAddress       string
+	WebAllowIP       string
 	TelegramToken    string
 	TelegramChatID   string
 	DatabaseDriver   string
@@ -67,12 +73,13 @@ func Run(ctx context.Context) (Settings, error) {
 	settings.WebAddress = prompt(reader, fmt.Sprintf("Web port [%s]: ", defaultPort), defaultPort)
 	settings.WebAddress = normalizeAddress(settings.WebAddress)
 
-	allowIP := prompt(reader, "Lock web port to a single IP with iptables? (leave empty to skip): ", "")
+	allowIP := prompt(reader, "Lock web port to a single IP with iptables? (leave empty to skip): ", stored.WebAllowIP)
 	if allowIP != "" {
 		if err := applyIptables(ctx, settings.WebAddress, allowIP); err != nil {
 			return Settings{}, err
 		}
 	}
+	settings.WebAllowIP = allowIP
 
 	settings.DatabaseDriver = prompt(reader, "Database driver [sqlite]: ", fallbackValue(stored.DatabaseDriver, "sqlite"))
 	settings.DatabaseDriver = strings.ToLower(strings.TrimSpace(settings.DatabaseDriver))
@@ -85,6 +92,14 @@ func Run(ctx context.Context) (Settings, error) {
 		settings.DatabaseDSN = defaultSQLitePath(settings.WebAddress)
 		fmt.Printf("SQLite database path: %s\n", settings.DatabaseDSN)
 	}
+
+	if settings.TelegramToken != "" && settings.TelegramChatID != "" {
+		if err := sendTelegramTest(ctx, settings); err != nil {
+			return Settings{}, err
+		}
+	}
+
+	printAccessSummary(settings)
 
 	if err := saveSettings(settings); err != nil {
 		return Settings{}, err
@@ -178,6 +193,7 @@ func loadSettings() (Settings, error) {
 	return Settings{
 		ImportNagiosPath: parsed["import_nagios"],
 		WebAddress:       parsed["web_addr"],
+		WebAllowIP:       parsed["web_allow_ip"],
 		TelegramToken:    parsed["telegram_token"],
 		TelegramChatID:   parsed["telegram_chat_id"],
 		DatabaseDriver:   parsed["db_driver"],
@@ -193,6 +209,7 @@ func saveSettings(settings Settings) error {
 	content := strings.Join([]string{
 		"import_nagios=" + settings.ImportNagiosPath,
 		"web_addr=" + settings.WebAddress,
+		"web_allow_ip=" + settings.WebAllowIP,
 		"telegram_token=" + settings.TelegramToken,
 		"telegram_chat_id=" + settings.TelegramChatID,
 		"db_driver=" + settings.DatabaseDriver,
@@ -216,6 +233,122 @@ func parseKeyValues(content string) map[string]string {
 		values[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
 	}
 	return values
+}
+
+func sendTelegramTest(ctx context.Context, settings Settings) error {
+	message := buildSetupMessage(settings)
+	payload := map[string]string{
+		"chat_id": settings.TelegramChatID,
+		"text":    message,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, telegramEndpoint(settings.TelegramToken), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 10 * time.Second}
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("telegram test failed: %s", response.Status)
+	}
+	return nil
+}
+
+func telegramEndpoint(token string) string {
+	return fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
+}
+
+func buildSetupMessage(settings Settings) string {
+	lines := []string{
+		"✅ chicha-pulse setup completed",
+		fmt.Sprintf("Nagios: %s", settings.ImportNagiosPath),
+		fmt.Sprintf("Web: %s", settings.WebAddress),
+		fmt.Sprintf("Database: %s (%s)", settings.DatabaseDriver, redactDSN(settings.DatabaseDSN)),
+	}
+	if settings.WebAllowIP != "" {
+		lines = append(lines, fmt.Sprintf("Web access: locked to %s via iptables", settings.WebAllowIP))
+	} else {
+		lines = append(lines, "Web access: open (no iptables lock)")
+	}
+	ips := listLocalIPs()
+	if len(ips) > 0 {
+		lines = append(lines, fmt.Sprintf("Local IPs: %s", strings.Join(ips, ", ")))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func redactDSN(dsn string) string {
+	if dsn == "" {
+		return ""
+	}
+	if strings.Contains(dsn, "://") {
+		parts := strings.SplitN(dsn, "://", 2)
+		return parts[0] + "://***"
+	}
+	if strings.Contains(dsn, "password=") {
+		return "***"
+	}
+	return dsn
+}
+
+func listLocalIPs() []string {
+	var ips []string
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return ips
+	}
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ip := extractIP(addr)
+			if ip != "" {
+				ips = append(ips, ip)
+			}
+		}
+	}
+	return ips
+}
+
+func extractIP(addr net.Addr) string {
+	switch value := addr.(type) {
+	case *net.IPNet:
+		if ip := value.IP.To4(); ip != nil {
+			return ip.String()
+		}
+	case *net.IPAddr:
+		if ip := value.IP.To4(); ip != nil {
+			return ip.String()
+		}
+	}
+	return ""
+}
+
+func printAccessSummary(settings Settings) {
+	fmt.Println("\nAccess summary:")
+	fmt.Printf("- Web address: %s\n", settings.WebAddress)
+	if settings.WebAllowIP != "" {
+		fmt.Printf("- Web access locked to: %s\n", settings.WebAllowIP)
+	} else {
+		fmt.Println("- Web access: open (no iptables lock)")
+	}
+	ips := listLocalIPs()
+	if len(ips) > 0 {
+		fmt.Printf("- Local IPs: %s\n", strings.Join(ips, ", "))
+	}
 }
 
 // ---- Nagios summary ----

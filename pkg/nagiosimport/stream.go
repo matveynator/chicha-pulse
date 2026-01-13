@@ -185,7 +185,7 @@ func buildObject(objectType string, data map[string]string) (Object, bool) {
 		if serviceName == "" || len(hostNames) == 0 {
 			return Object{}, false
 		}
-		sshUser, sshKey := parseSSHCommand(data["check_command"])
+		sshUser, sshKey, sshPort, sshCommand := parseSSHCommand(data["check_command"])
 		service := model.Service{
 			Name:                 serviceName,
 			CheckCommand:         data["check_command"],
@@ -195,6 +195,8 @@ func buildObject(objectType string, data map[string]string) (Object, bool) {
 			CheckIntervalMinutes: parseIntervalMinutes(data["check_interval"]),
 			SSHUser:              sshUser,
 			SSHKeyPath:           sshKey,
+			SSHPort:              sshPort,
+			SSHCommand:           sshCommand,
 		}
 		return Object{Kind: KindService, Service: service, HostNames: hostNames}, true
 	default:
@@ -231,19 +233,24 @@ func parseIntervalMinutes(value string) int {
 	return interval
 }
 
-func parseSSHCommand(command string) (string, string) {
+func parseSSHCommand(command string) (string, string, int, string) {
 	if command == "" {
-		return "", ""
+		return "", "", 0, ""
 	}
 	if strings.Contains(command, "check_by_ssh") {
 		parts := strings.Split(command, "!")
 		if len(parts) > 1 {
-			return strings.TrimSpace(parts[1]), findKeyPath(parts)
+			user := strings.TrimSpace(parts[1])
+			port := parseSSHPort(parts)
+			cmd := parseRemoteCommand(parts)
+			return user, findKeyPath(parts), port, cmd
 		}
 	}
 	fields := strings.Fields(command)
 	user := ""
 	key := ""
+	port := 0
+	remoteCommand := ""
 	for i := 0; i < len(fields); i++ {
 		switch fields[i] {
 		case "-l":
@@ -254,9 +261,17 @@ func parseSSHCommand(command string) (string, string) {
 			if i+1 < len(fields) {
 				key = fields[i+1]
 			}
+		case "-p":
+			if i+1 < len(fields) {
+				port = parseNumber(fields[i+1])
+			}
+		case "-C":
+			if i+1 < len(fields) {
+				remoteCommand = fields[i+1]
+			}
 		}
 	}
-	return user, key
+	return user, key, port, remoteCommand
 }
 
 func findKeyPath(parts []string) string {
@@ -266,4 +281,30 @@ func findKeyPath(parts []string) string {
 		}
 	}
 	return ""
+}
+
+func parseSSHPort(parts []string) int {
+	for index, part := range parts {
+		if part == "-p" && index+1 < len(parts) {
+			return parseNumber(parts[index+1])
+		}
+	}
+	return 0
+}
+
+func parseRemoteCommand(parts []string) string {
+	for index, part := range parts {
+		if part == "-C" && index+1 < len(parts) {
+			return parts[index+1]
+		}
+	}
+	return ""
+}
+
+func parseNumber(value string) int {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return 0
+	}
+	return parsed
 }

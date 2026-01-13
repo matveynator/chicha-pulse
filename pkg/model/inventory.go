@@ -17,6 +17,8 @@ type Service struct {
 	CheckIntervalMinutes int
 	SSHUser              string
 	SSHKeyPath           string
+	SSHPort              int
+	SSHCommand           string
 }
 
 // Host models a system that can hold services and relate to parent systems.

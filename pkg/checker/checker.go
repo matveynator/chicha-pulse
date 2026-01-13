@@ -10,24 +10,28 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
+	"chicha-pulse/pkg/model"
 	"chicha-pulse/pkg/store"
 	"golang.org/x/crypto/ssh"
 )
 
 // Job is a unit of work derived from Nagios configuration so checks can run concurrently.
 type Job struct {
-	HostName     string
-	HostAddress  string
-	ServiceName  string
-	CheckCommand string
-	Interval     time.Duration
-	SSHUser      string
-	SSHKeyPath   string
-	SSHPort      int
-	SSHCommand   string
+	HostName      string
+	HostAddress   string
+	ServiceName   string
+	CheckCommand  string
+	Interval      time.Duration
+	SSHUser       string
+	SSHKeyPath    string
+	SSHPort       int
+	SSHCommand    string
+	HostReachable bool
+	PingOutput    string
 }
 
 // Result captures the output and status so downstream stages can notify and store data.
@@ -61,6 +65,7 @@ func startScheduler(ctx context.Context, st *store.Store, jobCh chan<- Job) {
 	go func() {
 		defer close(jobCh)
 		nextRun := make(map[string]time.Time)
+		pingCache := make(map[string]pingResult)
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 
@@ -69,18 +74,27 @@ func startScheduler(ctx context.Context, st *store.Store, jobCh chan<- Job) {
 			case <-ctx.Done():
 				return
 			case now := <-ticker.C:
-				publishJobs(ctx, st, jobCh, nextRun, now)
+				publishJobs(ctx, st, jobCh, nextRun, pingCache, now)
 			}
 		}
 	}()
 }
 
-func publishJobs(ctx context.Context, st *store.Store, jobCh chan<- Job, nextRun map[string]time.Time, now time.Time) {
+func publishJobs(ctx context.Context, st *store.Store, jobCh chan<- Job, nextRun map[string]time.Time, pingCache map[string]pingResult, now time.Time) {
 	snapshot, err := st.Snapshot(ctx)
 	if err != nil {
 		return
 	}
 	for _, host := range snapshot.Hosts {
+		ping := cachedPing(ctx, host, pingCache, now)
+		if !ping.Reachable {
+			address := host.Address
+			if address == "" {
+				address = host.Name
+			}
+			log.Printf("skip checks host=%s address=%s reason=ping_failed", host.Name, address)
+			continue
+		}
 		for _, service := range host.Services {
 			key := host.Name + "/" + service.Name
 			interval := intervalForService(service.CheckIntervalMinutes)
@@ -88,15 +102,17 @@ func publishJobs(ctx context.Context, st *store.Store, jobCh chan<- Job, nextRun
 				continue
 			}
 			job := Job{
-				HostName:     host.Name,
-				HostAddress:  host.Address,
-				ServiceName:  service.Name,
-				CheckCommand: service.CheckCommand,
-				Interval:     interval,
-				SSHUser:      service.SSHUser,
-				SSHKeyPath:   service.SSHKeyPath,
-				SSHPort:      service.SSHPort,
-				SSHCommand:   service.SSHCommand,
+				HostName:      host.Name,
+				HostAddress:   host.Address,
+				ServiceName:   service.Name,
+				CheckCommand:  service.CheckCommand,
+				Interval:      interval,
+				SSHUser:       service.SSHUser,
+				SSHKeyPath:    service.SSHKeyPath,
+				SSHPort:       service.SSHPort,
+				SSHCommand:    service.SSHCommand,
+				HostReachable: ping.Reachable,
+				PingOutput:    ping.Output,
 			}
 			nextRun[key] = now.Add(interval)
 			select {
@@ -113,6 +129,45 @@ func intervalForService(minutes int) time.Duration {
 		return 5 * time.Minute
 	}
 	return time.Duration(minutes) * time.Minute
+}
+
+type pingResult struct {
+	CheckedAt time.Time
+	Reachable bool
+	Output    string
+}
+
+func cachedPing(ctx context.Context, host *model.Host, cache map[string]pingResult, now time.Time) pingResult {
+	key := host.Name
+	if host.Address != "" {
+		key = host.Address
+	}
+	if cached, ok := cache[key]; ok && now.Sub(cached.CheckedAt) < 30*time.Second {
+		return cached
+	}
+	result := pingHost(ctx, host)
+	cache[key] = result
+	return result
+}
+
+func pingHost(ctx context.Context, host *model.Host) pingResult {
+	address := host.Address
+	if address == "" {
+		address = host.Name
+	}
+	command := exec.CommandContext(ctx, "ping", "-c", "1", "-W", "1", address)
+	output, err := command.CombinedOutput()
+	result := pingResult{
+		CheckedAt: time.Now(),
+		Reachable: err == nil,
+		Output:    strings.TrimSpace(string(output)),
+	}
+	if result.Reachable {
+		log.Printf("ping ok host=%s address=%s", host.Name, address)
+	} else {
+		log.Printf("ping fail host=%s address=%s output=%q", host.Name, address, result.Output)
+	}
+	return result
 }
 
 // ---- Workers ----
@@ -167,6 +222,14 @@ func runCheck(ctx context.Context, job Job) Result {
 		CheckCommand: job.CheckCommand,
 		CheckedAt:    time.Now(),
 	}
+	if !job.HostReachable {
+		result.Status = 2
+		result.Output = "host unreachable (ping failed)"
+		if job.PingOutput != "" {
+			result.Output = result.Output + ": " + job.PingOutput
+		}
+		return result
+	}
 	if command == "" {
 		result.Status = 3
 		result.Output = "empty check command"
@@ -219,6 +282,12 @@ func runSSHCheck(ctx context.Context, job Job, result Result) Result {
 		remoteCommand = "uptime"
 	}
 	log.Printf("ssh check host=%s address=%s port=%d user=%s command=%q", job.HostName, address, port, job.SSHUser, remoteCommand)
+
+	if err := preflightTCP(ctx, address, port, "ssh"); err != nil {
+		result.Status = 2
+		result.Output = err.Error()
+		return result
+	}
 
 	config, err := sshConfig(job)
 	if err != nil {
@@ -302,17 +371,30 @@ func runTCPCheck(ctx context.Context, job Job, result Result) Result {
 		return result
 	}
 	log.Printf("tcp check host=%s address=%s port=%s", job.HostName, address, port)
-	dialer := net.Dialer{Timeout: 5 * time.Second}
-	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(address, port))
-	if err != nil {
+	portNumber := parsePort(port)
+	if err := preflightTCP(ctx, address, portNumber, "tcp"); err != nil {
 		result.Status = 2
 		result.Output = err.Error()
 		return result
 	}
-	_ = conn.Close()
 	result.Status = 0
 	result.Output = "ok"
 	return result
+}
+
+func preflightTCP(ctx context.Context, address string, port int, label string) error {
+	if port <= 0 {
+		return fmt.Errorf("%s preflight failed: invalid port", label)
+	}
+	dialer := net.Dialer{Timeout: 3 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(address, fmt.Sprintf("%d", port)))
+	if err != nil {
+		log.Printf("%s preflight fail address=%s port=%d err=%q", label, address, port, err.Error())
+		return fmt.Errorf("%s preflight failed: %s", label, err.Error())
+	}
+	_ = conn.Close()
+	log.Printf("%s preflight ok address=%s port=%d", label, address, port)
+	return nil
 }
 
 func extractPort(command string) string {
@@ -328,4 +410,12 @@ func extractPort(command string) string {
 		}
 	}
 	return ""
+}
+
+func parsePort(value string) int {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return 0
+	}
+	return parsed
 }

@@ -92,10 +92,12 @@ func publishJobs(ctx context.Context, st *store.Store, jobCh chan<- Job, nextRun
 			if address == "" {
 				address = host.Name
 			}
-			log.Printf("skip checks host=%s address=%s reason=ping_failed", host.Name, address)
-			continue
+			log.Printf("ping failed host=%s address=%s; only ssh checks will attempt a connect", host.Name, address)
 		}
 		for _, service := range host.Services {
+			if !ping.Reachable && !isSSHService(service) {
+				continue
+			}
 			key := host.Name + "/" + service.Name
 			interval := intervalForService(service.CheckIntervalMinutes)
 			if dueAt, ok := nextRun[key]; ok && now.Before(dueAt) {
@@ -216,13 +218,14 @@ func closeResults(ctx context.Context, workerDone <-chan struct{}, resultCh chan
 
 func runCheck(ctx context.Context, job Job) Result {
 	command := expandCommand(strings.TrimSpace(job.CheckCommand), job)
+	needsSSH := job.SSHCommand != "" || strings.Contains(command, "check_by_ssh") || isLegacyCheckSSHCommand(command)
 	result := Result{
 		HostName:     job.HostName,
 		ServiceName:  job.ServiceName,
 		CheckCommand: job.CheckCommand,
 		CheckedAt:    time.Now(),
 	}
-	if !job.HostReachable {
+	if !job.HostReachable && !needsSSH {
 		result.Status = 2
 		result.Output = "host unreachable (ping failed)"
 		if job.PingOutput != "" {
@@ -236,6 +239,9 @@ func runCheck(ctx context.Context, job Job) Result {
 		return result
 	}
 
+	if isLegacyCheckSSHCommand(command) {
+		return runLegacySSHCheck(ctx, job, result, command)
+	}
 	if job.SSHCommand != "" || strings.Contains(command, "check_by_ssh") {
 		return runSSHCheck(ctx, job, result)
 	}
@@ -284,7 +290,18 @@ func runSSHCheck(ctx context.Context, job Job, result Result) Result {
 	remoteCommand = expandCommand(remoteCommand, job)
 	log.Printf("ssh check host=%s address=%s port=%d user=%s command=%q", job.HostName, address, port, job.SSHUser, remoteCommand)
 
-	if err := preflightTCP(ctx, address, port, "ssh"); err != nil {
+	if !job.HostReachable {
+		if err := preflightTCP(ctx, address, port, "ssh"); err != nil {
+			result.Status = 2
+			result.Output = "ping failed; ssh services on this host will stay down until it responds"
+			if job.PingOutput != "" {
+				result.Output = result.Output + ": " + job.PingOutput
+			}
+			log.Printf("ssh skipped host=%s address=%s reason=ping_failed", job.HostName, address)
+			return result
+		}
+		log.Printf("ssh preflight ok host=%s address=%s port=%d despite ping failure", job.HostName, address, port)
+	} else if err := preflightTCP(ctx, address, port, "ssh"); err != nil {
 		result.Status = 2
 		result.Output = err.Error()
 		return result
@@ -335,6 +352,54 @@ func runSSHCheck(ctx context.Context, job Job, result Result) Result {
 	return result
 }
 
+func runLegacySSHCheck(ctx context.Context, job Job, result Result, command string) Result {
+	target, remoteCommand, err := parseCheckSSHCommand(command)
+	if err != nil {
+		result.Status = 3
+		result.Output = err.Error()
+		return result
+	}
+	host := hostFromTarget(target)
+	log.Printf("ssh check (legacy) host=%s target=%s command=%q", job.HostName, target, remoteCommand)
+	if !job.HostReachable {
+		if err := preflightTCP(ctx, host, 22, "ssh"); err != nil {
+			result.Status = 2
+			result.Output = "ping failed; ssh services on this host will stay down until it responds"
+			if job.PingOutput != "" {
+				result.Output = result.Output + ": " + job.PingOutput
+			}
+			log.Printf("ssh skipped host=%s address=%s reason=ping_failed", job.HostName, host)
+			return result
+		}
+		log.Printf("ssh preflight ok host=%s address=%s port=%d despite ping failure", job.HostName, host, 22)
+	} else if err := preflightTCP(ctx, host, 22, "ssh"); err != nil {
+		result.Status = 2
+		result.Output = err.Error()
+		return result
+	}
+	cmd := exec.CommandContext(ctx, "ssh", target, remoteCommand)
+	output, err := cmd.CombinedOutput()
+	result.Output = strings.TrimSpace(string(output))
+	if err != nil {
+		exitCode := cmd.ProcessState.ExitCode()
+		if exitCode == -1 {
+			exitCode = 2
+		}
+		result.Status = exitCode
+		if result.Output == "" {
+			result.Output = err.Error()
+		}
+		log.Printf("ssh error host=%s target=%s status=%d output=%q", job.HostName, target, result.Status, result.Output)
+		return result
+	}
+	result.Status = 0
+	if result.Output == "" {
+		result.Output = "ok"
+	}
+	log.Printf("ssh ok host=%s target=%s output=%q", job.HostName, target, result.Output)
+	return result
+}
+
 func expandCommand(command string, job Job) string {
 	// Replace Nagios-style host macros so checks run with resolved targets.
 	address := job.HostAddress
@@ -344,6 +409,51 @@ func expandCommand(command string, job Job) string {
 	expanded := strings.ReplaceAll(command, "$HOSTADDRESS$", address)
 	expanded = strings.ReplaceAll(expanded, "$HOSTNAME$", job.HostName)
 	return expanded
+}
+
+func isSSHService(service model.Service) bool {
+	// SSH checks need a connection attempt even when ping fails to show what is reachable.
+	command := strings.TrimSpace(service.CheckCommand)
+	return service.SSHCommand != "" || strings.Contains(command, "check_by_ssh") || isLegacyCheckSSHCommand(command)
+}
+
+func isLegacyCheckSSHCommand(command string) bool {
+	// Some configs still call check_ssh; detect it so we can run the native ssh command.
+	fields := strings.Fields(command)
+	for _, field := range fields {
+		if strings.HasSuffix(field, "check_ssh") || strings.Contains(field, "/check_ssh") {
+			return true
+		}
+	}
+	return false
+}
+
+func parseCheckSSHCommand(command string) (string, string, error) {
+	// Preserve the user@host token and the remote command so we can use the native ssh client.
+	fields := strings.Fields(command)
+	for index, field := range fields {
+		if strings.HasSuffix(field, "check_ssh") || strings.Contains(field, "/check_ssh") {
+			if index+1 >= len(fields) {
+				return "", "", fmt.Errorf("missing ssh target")
+			}
+			target := fields[index+1]
+			if index+2 >= len(fields) {
+				return "", "", fmt.Errorf("missing ssh remote command")
+			}
+			remoteCommand := strings.Join(fields[index+2:], " ")
+			return target, remoteCommand, nil
+		}
+	}
+	return "", "", fmt.Errorf("missing check_ssh command")
+}
+
+func hostFromTarget(target string) string {
+	// Split user@host so TCP preflight checks the real host.
+	if strings.Contains(target, "@") {
+		parts := strings.SplitN(target, "@", 2)
+		return parts[1]
+	}
+	return target
 }
 
 func sshConfig(job Job) (*ssh.ClientConfig, error) {

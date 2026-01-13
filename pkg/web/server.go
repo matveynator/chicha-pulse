@@ -28,11 +28,13 @@ type AuthConfig struct {
 // ---- Server ----
 
 type Server struct {
-	store     *store.Store
-	auth      AuthConfig
-	template  *template.Template
-	pageTitle string
-	allowIPs  []string
+	store          *store.Store
+	auth           AuthConfig
+	template       *template.Template
+	alertsTemplate *template.Template
+	hostsTemplate  *template.Template
+	pageTitle      string
+	allowIPs       []string
 }
 
 // NewServer prepares the HTTP handler so the caller can run it with a standard net/http server.
@@ -40,12 +42,20 @@ func NewServer(st *store.Store, auth AuthConfig, pageTitle string, allowIPs []st
 	page := template.Must(template.New("index").Funcs(template.FuncMap{
 		"statusBadge": statusBadge,
 	}).Parse(indexTemplate))
+	alerts := template.Must(template.New("alerts").Funcs(template.FuncMap{
+		"statusBadge": statusBadge,
+	}).Parse(alertsTemplate))
+	hosts := template.Must(template.New("hosts").Funcs(template.FuncMap{
+		"statusBadge": statusBadge,
+	}).Parse(hostsTemplate))
 	return &Server{
-		store:     st,
-		auth:      auth,
-		template:  page,
-		pageTitle: pageTitle,
-		allowIPs:  append([]string(nil), allowIPs...),
+		store:          st,
+		auth:           auth,
+		template:       page,
+		alertsTemplate: alerts,
+		hostsTemplate:  hosts,
+		pageTitle:      pageTitle,
+		allowIPs:       append([]string(nil), allowIPs...),
 	}, nil
 }
 
@@ -53,7 +63,9 @@ func NewServer(st *store.Store, auth AuthConfig, pageTitle string, allowIPs []st
 func (srv *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleIndex)
-	mux.HandleFunc("/events", srv.handleEvents)
+	mux.HandleFunc("/events/stats", srv.handleStatsEvents)
+	mux.HandleFunc("/events/alerts", srv.handleAlertsEvents)
+	mux.HandleFunc("/events/hosts", srv.handleHostsEvents)
 	mux.HandleFunc("/groups", srv.handleAddGroup)
 	mux.HandleFunc("/assign", srv.handleAssignGroup)
 	return srv.basicAuth(mux)
@@ -75,7 +87,7 @@ func (srv *Server) handleIndex(writer http.ResponseWriter, request *http.Request
 	}
 }
 
-func (srv *Server) handleEvents(writer http.ResponseWriter, request *http.Request) {
+func (srv *Server) handleStatsEvents(writer http.ResponseWriter, request *http.Request) {
 	flusher, ok := writer.(http.Flusher)
 	if !ok {
 		http.Error(writer, "streaming unsupported", http.StatusInternalServerError)
@@ -106,6 +118,100 @@ func (srv *Server) handleEvents(writer http.ResponseWriter, request *http.Reques
 			}
 			payload := buildStatsPayload(snapshot)
 			data, err := json.Marshal(payload)
+			if err != nil {
+				return
+			}
+			fmt.Fprintf(writer, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+	}
+}
+
+func (srv *Server) handleAlertsEvents(writer http.ResponseWriter, request *http.Request) {
+	flusher, ok := writer.(http.Flusher)
+	if !ok {
+		http.Error(writer, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	// Use SSE so the UI can update the alerts list without reloading the page.
+	writer.Header().Set("Content-Type", "text/event-stream")
+	writer.Header().Set("Cache-Control", "no-cache")
+	writer.Header().Set("Connection", "keep-alive")
+
+	ctx := request.Context()
+	stream, stop := srv.store.Subscribe(ctx)
+	defer stop()
+
+	keepAlive := time.NewTicker(15 * time.Second)
+	defer keepAlive.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-keepAlive.C:
+			fmt.Fprint(writer, ": keep-alive\n\n")
+			flusher.Flush()
+		case snapshot, ok := <-stream:
+			if !ok {
+				return
+			}
+			html, err := srv.renderAlertsHTML(buildAlerts(snapshot))
+			if err != nil {
+				return
+			}
+			data, err := json.Marshal(map[string]string{"html": html})
+			if err != nil {
+				return
+			}
+			fmt.Fprintf(writer, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+	}
+}
+
+func (srv *Server) handleHostsEvents(writer http.ResponseWriter, request *http.Request) {
+	flusher, ok := writer.(http.Flusher)
+	if !ok {
+		http.Error(writer, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	// Use SSE so the UI can update host/service state without full reloads.
+	writer.Header().Set("Content-Type", "text/event-stream")
+	writer.Header().Set("Cache-Control", "no-cache")
+	writer.Header().Set("Connection", "keep-alive")
+
+	ctx := request.Context()
+	stream, stop := srv.store.Subscribe(ctx)
+	defer stop()
+
+	keepAlive := time.NewTicker(15 * time.Second)
+	defer keepAlive.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-keepAlive.C:
+			fmt.Fprint(writer, ": keep-alive\n\n")
+			flusher.Flush()
+		case snapshot, ok := <-stream:
+			if !ok {
+				return
+			}
+			parents, heads := buildParentHierarchy(snapshot)
+			var headViews []hostView
+			for _, host := range heads {
+				headViews = append(headViews, buildHostView(host, parents, snapshot))
+			}
+			sort.Slice(headViews, func(i, j int) bool {
+				return headViews[i].Name < headViews[j].Name
+			})
+			html, err := srv.renderHostsHTML(headViews, snapshot)
+			if err != nil {
+				return
+			}
+			data, err := json.Marshal(map[string]string{"html": html})
 			if err != nil {
 				return
 			}
@@ -278,6 +384,37 @@ type statsPayload struct {
 	OverallClass  string `json:"overall_class"`
 }
 
+type alertsPayload struct {
+	Alerts []alertView
+}
+
+type hostsPayload struct {
+	Heads      []hostView
+	GroupNames []string
+}
+
+// ---- Template rendering ----
+
+func (srv *Server) renderAlertsHTML(alerts []alertView) (string, error) {
+	// Render just the alerts card so SSE updates stay lightweight.
+	var buffer strings.Builder
+	payload := buildAlertsPayload(alerts)
+	if err := srv.alertsTemplate.Execute(&buffer, payload); err != nil {
+		return "", err
+	}
+	return buffer.String(), nil
+}
+
+func (srv *Server) renderHostsHTML(heads []hostView, inventory model.Inventory) (string, error) {
+	// Render host hierarchy as a partial so the UI can swap it in-place.
+	var buffer strings.Builder
+	payload := buildHostsPayload(heads, inventory)
+	if err := srv.hostsTemplate.Execute(&buffer, payload); err != nil {
+		return "", err
+	}
+	return buffer.String(), nil
+}
+
 // ---- View helpers ----
 
 func buildView(inventory model.Inventory, title string) pageView {
@@ -301,6 +438,20 @@ func buildView(inventory model.Inventory, title string) pageView {
 		GroupNames:    groupNames,
 		Heads:         headViews,
 		Alerts:        alerts,
+	}
+}
+
+func buildAlertsPayload(alerts []alertView) alertsPayload {
+	// Keep a stable structure for the alerts stream payload.
+	return alertsPayload{Alerts: alerts}
+}
+
+func buildHostsPayload(heads []hostView, inventory model.Inventory) hostsPayload {
+	// Include group names so the host assignment dropdown stays current.
+	_, groupNames := buildGroups(inventory)
+	return hostsPayload{
+		Heads:      heads,
+		GroupNames: groupNames,
 	}
 }
 
@@ -747,53 +898,13 @@ const indexTemplate = `<!doctype html>
     {{end}}
   </div>
 
-  <div class="card">
-    <h2>Recent alerts</h2>
-    {{if .Alerts}}
-      <table>
-        <thead>
-          <tr><th>Status</th><th>Host</th><th>Service</th><th>Output</th><th>Checked</th></tr>
-        </thead>
-        <tbody>
-          {{range .Alerts}}
-            <tr>
-              <td><span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></td>
-              <td>{{.HostName}}</td>
-              <td>{{.ServiceName}}</td>
-              <td>{{.Output}}</td>
-              <td>{{.CheckedAt}}</td>
-            </tr>
-          {{end}}
-        </tbody>
-      </table>
-    {{else}}
-      <div class="meta">No active alerts.</div>
-    {{end}}
+  <div id="alerts-card">
+    {{template "alertsCard" .}}
   </div>
 
-  {{range .Heads}}
-    <div class="host {{.StatusClass}}">
-      <h2>{{.Name}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></h2>
-      {{if .Address}}<div class="meta">Address: {{.Address}}</div>{{end}}
-      {{if .OSName}}<div class="meta">OS: {{.OSLogo}} {{.OSName}} {{.OSVersion}}</div>{{end}}
-      {{if $.GroupNames}}
-        {{ $current := .Group }}
-        <form class="inline" method="post" action="/assign">
-          <input type="hidden" name="host" value="{{.Name}}" />
-          <select name="group">
-            {{range $.GroupNames}}
-              <option value="{{.}}" {{if eq . $current}}selected{{end}}>{{.}}</option>
-            {{end}}
-          </select>
-          <button type="submit">Assign group</button>
-        </form>
-      {{end}}
-      {{template "services" .}}
-      {{template "guests" .}}
-    </div>
-  {{else}}
-    <p>No hosts imported yet.</p>
-  {{end}}
+  <div id="hosts-tree">
+    {{template "hostsTree" .}}
+  </div>
   <script>
     (function () {
       // Use SSE to update the stats card without reloading the page.
@@ -827,7 +938,7 @@ const indexTemplate = `<!doctype html>
         return "badge-unknown";
       }
 
-      var source = new EventSource("/events");
+      var source = new EventSource("/events/stats");
       source.onmessage = function (event) {
         try {
           var payload = JSON.parse(event.data);
@@ -857,10 +968,83 @@ const indexTemplate = `<!doctype html>
       source.onerror = function () {
         connectionEl.textContent = "Live updates disconnected; retrying.";
       };
+
+      var alertsSource = new EventSource("/events/alerts");
+      alertsSource.onmessage = function (event) {
+        try {
+          var payload = JSON.parse(event.data);
+          document.getElementById("alerts-card").innerHTML = payload.html;
+        } catch (err) {
+          connectionEl.textContent = "Live updates received malformed data.";
+        }
+      };
+
+      var hostsSource = new EventSource("/events/hosts");
+      hostsSource.onmessage = function (event) {
+        try {
+          var payload = JSON.parse(event.data);
+          document.getElementById("hosts-tree").innerHTML = payload.html;
+        } catch (err) {
+          connectionEl.textContent = "Live updates received malformed data.";
+        }
+      };
     })();
   </script>
 </body>
 </html>
+{{define "alertsCard"}}
+  {{if .Alerts}}
+    <div class="card">
+      <h2>Recent alerts</h2>
+      <table>
+        <thead>
+          <tr><th>Status</th><th>Host</th><th>Service</th><th>Output</th><th>Checked</th></tr>
+        </thead>
+        <tbody>
+          {{range .Alerts}}
+            <tr>
+              <td><span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></td>
+              <td>{{.HostName}}</td>
+              <td>{{.ServiceName}}</td>
+              <td>{{.Output}}</td>
+              <td>{{.CheckedAt}}</td>
+            </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+  {{else}}
+    <div class="card">
+      <h2>Recent alerts</h2>
+      <div class="meta">No active alerts.</div>
+    </div>
+  {{end}}
+{{end}}
+{{define "hostsTree"}}
+  {{range .Heads}}
+    <div class="host {{.StatusClass}}">
+      <h2>{{.Name}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></h2>
+      {{if .Address}}<div class="meta">Address: {{.Address}}</div>{{end}}
+      {{if .OSName}}<div class="meta">OS: {{.OSLogo}} {{.OSName}} {{.OSVersion}}</div>{{end}}
+      {{if $.GroupNames}}
+        {{ $current := .Group }}
+        <form class="inline" method="post" action="/assign">
+          <input type="hidden" name="host" value="{{.Name}}" />
+          <select name="group">
+            {{range $.GroupNames}}
+              <option value="{{.}}" {{if eq . $current}}selected{{end}}>{{.}}</option>
+            {{end}}
+          </select>
+          <button type="submit">Assign group</button>
+        </form>
+      {{end}}
+      {{template "services" .}}
+      {{template "guests" .}}
+    </div>
+  {{else}}
+    <p>No hosts imported yet.</p>
+  {{end}}
+{{end}}
 {{define "services"}}
   {{if .Services}}
     <h3>Services</h3>
@@ -895,6 +1079,90 @@ const indexTemplate = `<!doctype html>
   {{end}}
 {{end}}
 `
+
+const alertsTemplate = `{{if .Alerts}}
+  <div class="card">
+    <h2>Recent alerts</h2>
+    <table>
+      <thead>
+        <tr><th>Status</th><th>Host</th><th>Service</th><th>Output</th><th>Checked</th></tr>
+      </thead>
+      <tbody>
+        {{range .Alerts}}
+          <tr>
+            <td><span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></td>
+            <td>{{.HostName}}</td>
+            <td>{{.ServiceName}}</td>
+            <td>{{.Output}}</td>
+            <td>{{.CheckedAt}}</td>
+          </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+{{else}}
+  <div class="card">
+    <h2>Recent alerts</h2>
+    <div class="meta">No active alerts.</div>
+  </div>
+{{end}}`
+
+const hostsTemplate = `{{range .Heads}}
+  <div class="host {{.StatusClass}}">
+    <h2>{{.Name}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></h2>
+    {{if .Address}}<div class="meta">Address: {{.Address}}</div>{{end}}
+    {{if .OSName}}<div class="meta">OS: {{.OSLogo}} {{.OSName}} {{.OSVersion}}</div>{{end}}
+    {{if $.GroupNames}}
+      {{ $current := .Group }}
+      <form class="inline" method="post" action="/assign">
+        <input type="hidden" name="host" value="{{.Name}}" />
+        <select name="group">
+          {{range $.GroupNames}}
+            <option value="{{.}}" {{if eq . $current}}selected{{end}}>{{.}}</option>
+          {{end}}
+        </select>
+        <button type="submit">Assign group</button>
+      </form>
+    {{end}}
+    {{template "services" .}}
+    {{template "guests" .}}
+  </div>
+{{else}}
+  <p>No hosts imported yet.</p>
+{{end}}
+{{define "services"}}
+  {{if .Services}}
+    <h3>Services</h3>
+    <ul class="services">
+      {{range .Services}}
+        <li>
+          <strong>{{.Name}}</strong>
+          <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span>
+          — {{.Command}}
+          {{if .Notes}} ({{.Notes}}){{end}}
+          {{if .Interval}}<span class="meta"> every {{.Interval}}m</span>{{end}}
+          {{if .SSHUser}}<span class="meta"> ssh {{.SSHUser}}</span>{{end}}
+          {{if .SSHKeyPath}}<span class="meta"> key {{.SSHKeyPath}}</span>{{end}}
+          {{if .CheckedAt}}<div class="meta">Checked: {{.CheckedAt}} — {{.Output}}</div>{{end}}
+        </li>
+      {{end}}
+    </ul>
+  {{end}}
+{{end}}
+{{define "guests"}}
+  {{if .Guests}}
+    <h3>Virtual machines</h3>
+    {{range .Guests}}
+      <div class="guest {{.StatusClass}}">
+        <h4>{{.Name}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></h4>
+        {{if .Address}}<div class="meta">Address: {{.Address}}</div>{{end}}
+        {{if .OSName}}<div class="meta">OS: {{.OSLogo}} {{.OSName}} {{.OSVersion}}</div>{{end}}
+        {{template "services" .}}
+        {{template "guests" .}}
+      </div>
+    {{end}}
+  {{end}}
+{{end}}`
 
 // ---- Template helpers ----
 

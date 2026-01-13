@@ -48,6 +48,39 @@ type Result struct {
 	CheckedAt    time.Time
 }
 
+// ---- Logging helpers ----
+
+const (
+	colorReset  = "\033[0m"
+	colorBlue   = "\033[34m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	colorRed    = "\033[31m"
+	colorPurple = "\033[35m"
+)
+
+func logSession(sessionID uint64, color string, format string, args ...any) {
+	// Colorized session logs make it easier to follow the execution stages in order.
+	message := fmt.Sprintf(format, args...)
+	log.Printf("%ssession=%d %s%s", color, sessionID, message, colorReset)
+}
+
+func logSessionInfo(sessionID uint64, format string, args ...any) {
+	logSession(sessionID, colorBlue, format, args...)
+}
+
+func logSessionWarn(sessionID uint64, format string, args ...any) {
+	logSession(sessionID, colorYellow, format, args...)
+}
+
+func logSessionError(sessionID uint64, format string, args ...any) {
+	logSession(sessionID, colorRed, format, args...)
+}
+
+func logSessionSuccess(sessionID uint64, format string, args ...any) {
+	logSession(sessionID, colorGreen, format, args...)
+}
+
 // ---- Public pipeline ----
 
 // Start launches the scheduler and worker pool with channels to avoid shared-state locks.
@@ -97,13 +130,19 @@ func publishJobs(ctx context.Context, st *store.Store, jobCh chan<- Job, nextRun
 		if address == "" {
 			address = host.Name
 		}
-		log.Printf("session start host=%s address=%s session=%d", host.Name, address, sessionID)
-		if !ping.Reachable {
-			log.Printf("ping failed host=%s address=%s session=%d; only ssh checks will attempt a connect", host.Name, address, sessionID)
+		logSessionInfo(sessionID, "stage=START host=%s address=%s", host.Name, address)
+		if ping.Reachable {
+			logSessionSuccess(sessionID, "stage=PING host=%s address=%s result=ok", host.Name, address)
+		} else {
+			logSessionWarn(sessionID, "stage=PING host=%s address=%s result=failed", host.Name, address)
+		}
+		planned := describeServicePlan(host.Services, ping.Reachable)
+		if len(planned) > 0 {
+			logSessionInfo(sessionID, "stage=PLAN host=%s checks=%s", host.Name, strings.Join(planned, ", "))
 		}
 		for _, service := range host.Services {
 			if !ping.Reachable && !isSSHService(service) {
-				log.Printf("check blocked host=%s service=%s session=%d reason=ping_failed", host.Name, service.Name, sessionID)
+				logSessionWarn(sessionID, "stage=CHECK host=%s service=%s seq=%d result=blocked reason=ping_failed", host.Name, service.Name, sequence+1)
 				continue
 			}
 			key := host.Name + "/" + service.Name
@@ -144,6 +183,36 @@ func intervalForService(minutes int) time.Duration {
 	return time.Duration(minutes) * time.Minute
 }
 
+func describeServicePlan(services []model.Service, reachable bool) []string {
+	// Build a compact plan list so the session log shows what will run.
+	planned := make([]string, 0, len(services))
+	for _, service := range services {
+		entry := fmt.Sprintf("%s[%s]", service.Name, serviceKind(service))
+		if !reachable && !isSSHService(service) {
+			entry = entry + "(blocked:ping)"
+		}
+		planned = append(planned, entry)
+	}
+	return planned
+}
+
+func serviceKind(service model.Service) string {
+	// Identify checks at a glance so operators can understand the plan.
+	command := strings.TrimSpace(service.CheckCommand)
+	switch {
+	case service.SSHCommand != "":
+		return "ssh"
+	case strings.Contains(command, "check_by_ssh"):
+		return "ssh"
+	case isLegacyCheckSSHCommand(command):
+		return "ssh"
+	case strings.Contains(command, "check_tcp"):
+		return "tcp"
+	default:
+		return "exec"
+	}
+}
+
 type pingResult struct {
 	CheckedAt time.Time
 	Reachable bool
@@ -181,11 +250,6 @@ func pingHost(ctx context.Context, host *model.Host) pingResult {
 		CheckedAt: time.Now(),
 		Reachable: err == nil,
 		Output:    strings.TrimSpace(string(output)),
-	}
-	if result.Reachable {
-		log.Printf("ping ok host=%s address=%s", host.Name, address)
-	} else {
-		log.Printf("ping fail host=%s address=%s output=%q", host.Name, address, result.Output)
 	}
 	return result
 }
@@ -243,19 +307,20 @@ func runCheck(ctx context.Context, job Job) Result {
 		CheckCommand: job.CheckCommand,
 		CheckedAt:    time.Now(),
 	}
+	logSessionInfo(job.SessionID, "stage=CHECK host=%s service=%s seq=%d attempt=1", job.HostName, job.ServiceName, job.Sequence)
 	if !job.HostReachable && !needsSSH {
 		result.Status = 2
 		result.Output = "host unreachable (ping failed)"
 		if job.PingOutput != "" {
 			result.Output = result.Output + ": " + job.PingOutput
 		}
-		log.Printf("session=%d host=%s service=%s seq=%d step=blocked reason=ping_failed", job.SessionID, job.HostName, job.ServiceName, job.Sequence)
+		logSessionWarn(job.SessionID, "stage=CHECK host=%s service=%s seq=%d result=blocked reason=ping_failed", job.HostName, job.ServiceName, job.Sequence)
 		return result
 	}
 	if command == "" {
 		result.Status = 3
 		result.Output = "empty check command"
-		log.Printf("session=%d host=%s service=%s seq=%d step=blocked reason=empty_command", job.SessionID, job.HostName, job.ServiceName, job.Sequence)
+		logSessionWarn(job.SessionID, "stage=CHECK host=%s service=%s seq=%d result=blocked reason=empty_command", job.HostName, job.ServiceName, job.Sequence)
 		return result
 	}
 
@@ -281,7 +346,7 @@ func runCheck(ctx context.Context, job Job) Result {
 		if result.Output == "" {
 			result.Output = err.Error()
 		}
-		log.Printf("session=%d host=%s service=%s seq=%d step=error status=%d output=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, result.Status, result.Output)
+		logSessionError(job.SessionID, "stage=CHECK host=%s service=%s seq=%d result=error status=%d output=%q", job.HostName, job.ServiceName, job.Sequence, result.Status, result.Output)
 		return result
 	}
 
@@ -289,7 +354,7 @@ func runCheck(ctx context.Context, job Job) Result {
 	if result.Output == "" {
 		result.Output = "ok"
 	}
-	log.Printf("session=%d host=%s service=%s seq=%d step=ok output=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, result.Output)
+	logSessionSuccess(job.SessionID, "stage=CHECK host=%s service=%s seq=%d result=ok output=%q", job.HostName, job.ServiceName, job.Sequence, result.Output)
 	return result
 }
 
@@ -315,10 +380,10 @@ func runSSHCheck(ctx context.Context, job Job, result Result) Result {
 			if job.PingOutput != "" {
 				result.Output = result.Output + ": " + job.PingOutput
 			}
-			log.Printf("session=%d host=%s service=%s seq=%d step=blocked reason=ping_failed address=%s", job.SessionID, job.HostName, job.ServiceName, job.Sequence, address)
+			logSessionWarn(job.SessionID, "stage=SSH host=%s service=%s seq=%d result=blocked reason=ping_failed address=%s", job.HostName, job.ServiceName, job.Sequence, address)
 			return result
 		}
-		log.Printf("session=%d host=%s service=%s seq=%d step=ssh-preflight-ok address=%s port=%d despite ping failure", job.SessionID, job.HostName, job.ServiceName, job.Sequence, address, port)
+		logSessionInfo(job.SessionID, "stage=SSH host=%s service=%s seq=%d preflight=ok address=%s port=%d despite_ping=true", job.HostName, job.ServiceName, job.Sequence, address, port)
 	} else if err := preflightTCP(ctx, address, port, "ssh", job.SessionID); err != nil {
 		result.Status = 2
 		result.Output = err.Error()
@@ -329,15 +394,15 @@ func runSSHCheck(ctx context.Context, job Job, result Result) Result {
 	if err != nil {
 		result.Status = 2
 		result.Output = err.Error()
-		log.Printf("session=%d host=%s service=%s seq=%d step=ssh-connect-fail address=%s port=%d err=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, address, port, result.Output)
+		logSessionError(job.SessionID, "stage=SSH host=%s service=%s seq=%d result=auth-failed address=%s port=%d err=%q", job.HostName, job.ServiceName, job.Sequence, address, port, result.Output)
 		return result
 	}
-	log.Printf("session=%d host=%s service=%s seq=%d step=ssh-auth address=%s port=%d user=%s keys=%s", job.SessionID, job.HostName, job.ServiceName, job.Sequence, address, port, config.client.User, strings.Join(config.authSources, ","))
+	logSessionInfo(job.SessionID, "stage=SSH host=%s service=%s seq=%d auth=user:%s keys=%s", job.HostName, job.ServiceName, job.Sequence, config.client.User, strings.Join(config.authSources, ","))
 	client, err := ssh.Dial("tcp", net.JoinHostPort(address, fmt.Sprintf("%d", port)), config.client)
 	if err != nil {
 		result.Status = 2
 		result.Output = err.Error()
-		log.Printf("session=%d host=%s service=%s seq=%d step=ssh-connect-fail address=%s port=%d err=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, address, port, result.Output)
+		logSessionError(job.SessionID, "stage=SSH host=%s service=%s seq=%d result=connect-failed address=%s port=%d err=%q", job.HostName, job.ServiceName, job.Sequence, address, port, result.Output)
 		return result
 	}
 	defer client.Close()
@@ -346,7 +411,7 @@ func runSSHCheck(ctx context.Context, job Job, result Result) Result {
 	if err != nil {
 		result.Status = 2
 		result.Output = err.Error()
-		log.Printf("session=%d host=%s service=%s seq=%d step=ssh-exec-fail address=%s port=%d err=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, address, port, result.Output)
+		logSessionError(job.SessionID, "stage=SSH host=%s service=%s seq=%d result=exec-failed address=%s port=%d err=%q", job.HostName, job.ServiceName, job.Sequence, address, port, result.Output)
 		return result
 	}
 	defer session.Close()
@@ -358,7 +423,7 @@ func runSSHCheck(ctx context.Context, job Job, result Result) Result {
 		if result.Output == "" {
 			result.Output = err.Error()
 		}
-		log.Printf("session=%d host=%s service=%s seq=%d step=ssh-exec-fail address=%s port=%d output=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, address, port, result.Output)
+		logSessionError(job.SessionID, "stage=SSH host=%s service=%s seq=%d result=exec-failed address=%s port=%d output=%q", job.HostName, job.ServiceName, job.Sequence, address, port, result.Output)
 		return result
 	}
 
@@ -366,7 +431,7 @@ func runSSHCheck(ctx context.Context, job Job, result Result) Result {
 	if result.Output == "" {
 		result.Output = "ok"
 	}
-	log.Printf("session=%d host=%s service=%s seq=%d step=ssh-exec-ok address=%s port=%d output=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, address, port, result.Output)
+	logSessionSuccess(job.SessionID, "stage=SSH host=%s service=%s seq=%d result=ok address=%s port=%d output=%q", job.HostName, job.ServiceName, job.Sequence, address, port, result.Output)
 	return result
 }
 
@@ -386,10 +451,10 @@ func runLegacySSHCheck(ctx context.Context, job Job, result Result, command stri
 			if job.PingOutput != "" {
 				result.Output = result.Output + ": " + job.PingOutput
 			}
-			log.Printf("session=%d host=%s service=%s seq=%d step=blocked reason=ping_failed address=%s", job.SessionID, job.HostName, job.ServiceName, job.Sequence, host)
+			logSessionWarn(job.SessionID, "stage=SSH host=%s service=%s seq=%d result=blocked reason=ping_failed address=%s", job.HostName, job.ServiceName, job.Sequence, host)
 			return result
 		}
-		log.Printf("session=%d host=%s service=%s seq=%d step=ssh-preflight-ok address=%s port=%d despite ping failure", job.SessionID, job.HostName, job.ServiceName, job.Sequence, host, 22)
+		logSessionInfo(job.SessionID, "stage=SSH host=%s service=%s seq=%d preflight=ok address=%s port=%d despite_ping=true", job.HostName, job.ServiceName, job.Sequence, host, 22)
 	} else if err := preflightTCP(ctx, host, 22, "ssh", job.SessionID); err != nil {
 		result.Status = 2
 		result.Output = err.Error()
@@ -400,15 +465,15 @@ func runLegacySSHCheck(ctx context.Context, job Job, result Result, command stri
 	if err != nil {
 		result.Status = 2
 		result.Output = err.Error()
-		log.Printf("session=%d host=%s service=%s seq=%d step=ssh-legacy-connect-fail target=%s err=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, target, result.Output)
+		logSessionError(job.SessionID, "stage=SSH host=%s service=%s seq=%d result=auth-failed target=%s err=%q", job.HostName, job.ServiceName, job.Sequence, target, result.Output)
 		return result
 	}
-	log.Printf("session=%d host=%s service=%s seq=%d step=ssh-legacy-auth target=%s keys=%s", job.SessionID, job.HostName, job.ServiceName, job.Sequence, target, strings.Join(config.authSources, ","))
+	logSessionInfo(job.SessionID, "stage=SSH host=%s service=%s seq=%d auth=user:%s keys=%s target=%s", job.HostName, job.ServiceName, job.Sequence, config.client.User, strings.Join(config.authSources, ","), target)
 	client, err := ssh.Dial("tcp", net.JoinHostPort(host, "22"), config.client)
 	if err != nil {
 		result.Status = 2
 		result.Output = err.Error()
-		log.Printf("session=%d host=%s service=%s seq=%d step=ssh-legacy-connect-fail target=%s err=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, target, result.Output)
+		logSessionError(job.SessionID, "stage=SSH host=%s service=%s seq=%d result=connect-failed target=%s err=%q", job.HostName, job.ServiceName, job.Sequence, target, result.Output)
 		return result
 	}
 	defer client.Close()
@@ -417,7 +482,7 @@ func runLegacySSHCheck(ctx context.Context, job Job, result Result, command stri
 	if err != nil {
 		result.Status = 2
 		result.Output = err.Error()
-		log.Printf("session=%d host=%s service=%s seq=%d step=ssh-legacy-exec-fail target=%s err=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, target, result.Output)
+		logSessionError(job.SessionID, "stage=SSH host=%s service=%s seq=%d result=exec-failed target=%s err=%q", job.HostName, job.ServiceName, job.Sequence, target, result.Output)
 		return result
 	}
 	defer session.Close()
@@ -429,14 +494,14 @@ func runLegacySSHCheck(ctx context.Context, job Job, result Result, command stri
 		if result.Output == "" {
 			result.Output = err.Error()
 		}
-		log.Printf("session=%d host=%s service=%s seq=%d step=ssh-legacy-exec-fail target=%s output=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, target, result.Output)
+		logSessionError(job.SessionID, "stage=SSH host=%s service=%s seq=%d result=exec-failed target=%s output=%q", job.HostName, job.ServiceName, job.Sequence, target, result.Output)
 		return result
 	}
 	result.Status = 0
 	if result.Output == "" {
 		result.Output = "ok"
 	}
-	log.Printf("session=%d host=%s service=%s seq=%d step=ssh-legacy-ok target=%s output=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, target, result.Output)
+	logSessionSuccess(job.SessionID, "stage=SSH host=%s service=%s seq=%d result=ok target=%s output=%q", job.HostName, job.ServiceName, job.Sequence, target, result.Output)
 	return result
 }
 
@@ -575,7 +640,10 @@ func buildAuthMethods(ctx context.Context, job Job) ([]ssh.AuthMethod, []string,
 	}
 	keyring, err := sshkeys.LoadKeyringFromSettings(ctx)
 	if err != nil {
-		return nil, nil, err
+		if shouldLogSessionOnce(sessionLogKey{SessionID: job.SessionID, Label: "keyring"}) {
+			logSessionWarn(job.SessionID, "stage=SSH host=%s keyring=unavailable err=%q", job.HostName, err.Error())
+		}
+		return authMethods, authSources, nil
 	}
 	for _, record := range keyring {
 		signer, err := parseKeySigner(record.PrivateKey, record.Passphrase)
@@ -610,7 +678,7 @@ func runTCPCheck(ctx context.Context, job Job, result Result) Result {
 	if port == "" {
 		result.Status = 3
 		result.Output = "missing port"
-		log.Printf("session=%d host=%s service=%s seq=%d step=blocked reason=missing_port", job.SessionID, job.HostName, job.ServiceName, job.Sequence)
+		logSessionWarn(job.SessionID, "stage=TCP host=%s service=%s seq=%d result=blocked reason=missing_port", job.HostName, job.ServiceName, job.Sequence)
 		return result
 	}
 	portNumber := parsePort(port)
@@ -621,7 +689,7 @@ func runTCPCheck(ctx context.Context, job Job, result Result) Result {
 	}
 	result.Status = 0
 	result.Output = "ok"
-	log.Printf("session=%d host=%s service=%s seq=%d step=tcp-ok", job.SessionID, job.HostName, job.ServiceName, job.Sequence)
+	logSessionSuccess(job.SessionID, "stage=TCP host=%s service=%s seq=%d result=ok", job.HostName, job.ServiceName, job.Sequence)
 	return result
 }
 
@@ -633,13 +701,13 @@ func preflightTCP(ctx context.Context, address string, port int, label string, s
 	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(address, fmt.Sprintf("%d", port)))
 	if err != nil {
 		if shouldLogPreflight(preflightKey{SessionID: sessionID, Address: address, Port: port, Label: label}) {
-			log.Printf("session=%d %s preflight fail address=%s port=%d err=%q", sessionID, label, address, port, err.Error())
+			logSessionWarn(sessionID, "stage=%s preflight=fail address=%s port=%d err=%q", strings.ToUpper(label), address, port, err.Error())
 		}
 		return fmt.Errorf("%s preflight failed: %s", label, err.Error())
 	}
 	_ = conn.Close()
 	if shouldLogPreflight(preflightKey{SessionID: sessionID, Address: address, Port: port, Label: label}) {
-		log.Printf("session=%d %s preflight ok address=%s port=%d", sessionID, label, address, port)
+		logSessionInfo(sessionID, "stage=%s preflight=ok address=%s port=%d", strings.ToUpper(label), address, port)
 	}
 	return nil
 }
@@ -683,11 +751,35 @@ type preflightLogRequest struct {
 
 var preflightLogCh = make(chan preflightLogRequest)
 
+type sessionLogKey struct {
+	SessionID uint64
+	Label     string
+}
+
+type sessionLogRequest struct {
+	Key   sessionLogKey
+	Reply chan bool
+}
+
+var sessionLogCh = make(chan sessionLogRequest)
+
 func init() {
 	// Run a single goroutine to track preflight logs without mutexes.
 	go func() {
 		seen := make(map[preflightKey]bool)
 		for request := range preflightLogCh {
+			if seen[request.Key] {
+				request.Reply <- false
+				continue
+			}
+			seen[request.Key] = true
+			request.Reply <- true
+		}
+	}()
+	// Track once-per-session logs with a separate channel for clarity.
+	go func() {
+		seen := make(map[sessionLogKey]bool)
+		for request := range sessionLogCh {
 			if seen[request.Key] {
 				request.Reply <- false
 				continue
@@ -702,5 +794,12 @@ func shouldLogPreflight(key preflightKey) bool {
 	// Use a channel round-trip so log spam is reduced per session.
 	reply := make(chan bool, 1)
 	preflightLogCh <- preflightLogRequest{Key: key, Reply: reply}
+	return <-reply
+}
+
+func shouldLogSessionOnce(key sessionLogKey) bool {
+	// Use a channel round-trip so warnings appear once per session.
+	reply := make(chan bool, 1)
+	sessionLogCh <- sessionLogRequest{Key: key, Reply: reply}
 	return <-reply
 }

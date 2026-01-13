@@ -162,6 +162,9 @@ FROM setup_ssh_keys ORDER BY created_at DESC LIMIT 3`
 func LoadKeyringFromSettings(ctx context.Context) ([]KeyRecord, error) {
 	values, err := readSettingsFile()
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	return LoadKeyring(ctx, values["db_driver"], values["db_dsn"])

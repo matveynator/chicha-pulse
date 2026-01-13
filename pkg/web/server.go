@@ -223,6 +223,9 @@ type hostView struct {
 	Name        string
 	Address     string
 	Group       string
+	OSName      string
+	OSVersion   string
+	OSLogo      string
 	StatusLabel string
 	StatusClass string
 	Services    []serviceView
@@ -252,35 +255,33 @@ type alertView struct {
 }
 
 type statsView struct {
-	Total    int
-	Errors   int
-	Warning  int
-	Critical int
-	Unknown  int
+	Total        int
+	Errors       int
+	Warning      int
+	Critical     int
+	Unknown      int
+	Planned      int
+	Running      int
+	OverallLabel string
+	OverallClass string
 }
 
 type statsPayload struct {
-	TotalServices int `json:"total_services"`
-	ErrorCount    int `json:"error_count"`
-	WarningCount  int `json:"warning_count"`
-	CriticalCount int `json:"critical_count"`
-	UnknownCount  int `json:"unknown_count"`
+	TotalServices int    `json:"total_services"`
+	ErrorCount    int    `json:"error_count"`
+	WarningCount  int    `json:"warning_count"`
+	CriticalCount int    `json:"critical_count"`
+	UnknownCount  int    `json:"unknown_count"`
+	PlannedCount  int    `json:"planned_count"`
+	RunningCount  int    `json:"running_count"`
+	OverallLabel  string `json:"overall_label"`
+	OverallClass  string `json:"overall_class"`
 }
 
 // ---- View helpers ----
 
 func buildView(inventory model.Inventory, title string) pageView {
-	parents := map[string][]*model.Host{}
-	var heads []*model.Host
-	for _, host := range inventory.Hosts {
-		if len(host.Parents) == 0 {
-			heads = append(heads, host)
-			continue
-		}
-		for _, parent := range host.Parents {
-			parents[parent] = append(parents[parent], host)
-		}
-	}
+	parents, heads := buildParentHierarchy(inventory)
 
 	var headViews []hostView
 	for _, host := range heads {
@@ -301,6 +302,33 @@ func buildView(inventory model.Inventory, title string) pageView {
 		Heads:         headViews,
 		Alerts:        alerts,
 	}
+}
+
+func buildParentHierarchy(inventory model.Inventory) (map[string][]*model.Host, []*model.Host) {
+	// Prefer detected parents so live topology overrides static Nagios parents.
+	parents := map[string][]*model.Host{}
+	var heads []*model.Host
+	for _, host := range inventory.Hosts {
+		parentNames := resolveHostParents(host)
+		if len(parentNames) == 0 {
+			heads = append(heads, host)
+			continue
+		}
+		for _, parent := range parentNames {
+			parents[parent] = append(parents[parent], host)
+		}
+	}
+	return parents, heads
+}
+
+func resolveHostParents(host *model.Host) []string {
+	if strings.TrimSpace(host.DetectedParent) != "" {
+		return []string{host.DetectedParent}
+	}
+	if len(host.Parents) == 0 {
+		return nil
+	}
+	return append([]string(nil), host.Parents...)
 }
 
 func buildGroups(inventory model.Inventory) ([]groupView, []string) {
@@ -398,6 +426,9 @@ func buildHostView(host *model.Host, parents map[string][]*model.Host, inventory
 		Name:        host.Name,
 		Address:     host.Address,
 		Group:       host.Group,
+		OSName:      host.OSName,
+		OSVersion:   host.OSVersion,
+		OSLogo:      host.OSLogo,
 		StatusLabel: label,
 		StatusClass: class,
 		Services:    services,
@@ -430,6 +461,9 @@ func buildStats(inventory model.Inventory) statsView {
 		}
 	}
 	stats.Errors = stats.Warning + stats.Critical + stats.Unknown
+	stats.Planned = inventory.Activity.Planned
+	stats.Running = inventory.Activity.Running
+	stats.OverallLabel, stats.OverallClass = overallStatus(inventory)
 	return stats
 }
 
@@ -442,7 +476,27 @@ func buildStatsPayload(inventory model.Inventory) statsPayload {
 		WarningCount:  stats.Warning,
 		CriticalCount: stats.Critical,
 		UnknownCount:  stats.Unknown,
+		PlannedCount:  stats.Planned,
+		RunningCount:  stats.Running,
+		OverallLabel:  stats.OverallLabel,
+		OverallClass:  stats.OverallClass,
 	}
+}
+
+func overallStatus(inventory model.Inventory) (string, string) {
+	// Summarize the worst status so the UI can color the live indicator.
+	worst := -1
+	for _, status := range inventory.Statuses {
+		label, _ := statusLabel(status.Status)
+		severity := statusSeverity(label)
+		if severity > worst {
+			worst = severity
+		}
+	}
+	if worst == -1 {
+		return "UNKNOWN", "status-unknown"
+	}
+	return statusLabelFromSeverity(worst)
 }
 
 func hostStatus(host *model.Host, inventory model.Inventory) (string, string) {
@@ -648,6 +702,7 @@ const indexTemplate = `<!doctype html>
     .stats-row { display: flex; flex-wrap: wrap; gap: 1rem; }
     .stats-item { min-width: 10rem; }
     .live-indicator { font-weight: bold; color: #2c3e50; }
+    .trend { font-weight: bold; margin-left: 0.5rem; }
   </style>
 </head>
 <body>
@@ -657,10 +712,13 @@ const indexTemplate = `<!doctype html>
     <h2>Live task stats</h2>
     <div class="stats-row">
       <div class="stats-item"><strong>Total services:</strong> <span id="stat-total">{{.Stats.Total}}</span></div>
-      <div class="stats-item"><strong>Errors:</strong> <span id="stat-errors">{{.Stats.Errors}}</span></div>
+      <div class="stats-item"><strong>Errors:</strong> <span id="stat-errors">{{.Stats.Errors}}</span><span id="stat-error-trend" class="trend"></span></div>
       <div class="stats-item">Warning: <span id="stat-warning">{{.Stats.Warning}}</span></div>
       <div class="stats-item">Critical: <span id="stat-critical">{{.Stats.Critical}}</span></div>
       <div class="stats-item">Unknown: <span id="stat-unknown">{{.Stats.Unknown}}</span></div>
+      <div class="stats-item">Planned soon: <span id="stat-planned">{{.Stats.Planned}}</span></div>
+      <div class="stats-item">Running now: <span id="stat-running">{{.Stats.Running}}</span></div>
+      <div class="stats-item">Overall: <span id="stat-overall" class="badge {{statusBadge .Stats.OverallClass}}">{{.Stats.OverallLabel}}</span></div>
     </div>
     <div class="meta live-indicator" id="stat-connection">Live updates connected.</div>
   </div>
@@ -717,6 +775,7 @@ const indexTemplate = `<!doctype html>
     <div class="host {{.StatusClass}}">
       <h2>{{.Name}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></h2>
       {{if .Address}}<div class="meta">Address: {{.Address}}</div>{{end}}
+      {{if .OSName}}<div class="meta">OS: {{.OSLogo}} {{.OSName}} {{.OSVersion}}</div>{{end}}
       {{if $.GroupNames}}
         {{ $current := .Group }}
         <form class="inline" method="post" action="/assign">
@@ -743,11 +802,29 @@ const indexTemplate = `<!doctype html>
       var warningEl = document.getElementById("stat-warning");
       var criticalEl = document.getElementById("stat-critical");
       var unknownEl = document.getElementById("stat-unknown");
+      var plannedEl = document.getElementById("stat-planned");
+      var runningEl = document.getElementById("stat-running");
+      var overallEl = document.getElementById("stat-overall");
       var connectionEl = document.getElementById("stat-connection");
+      var trendEl = document.getElementById("stat-error-trend");
+      var lastErrors = Number(errorEl.textContent) || 0;
 
       if (!window.EventSource) {
         connectionEl.textContent = "Live updates unavailable (EventSource not supported).";
         return;
+      }
+
+      function statusBadge(statusClass) {
+        if (statusClass === "status-ok") {
+          return "badge-ok";
+        }
+        if (statusClass === "status-warning") {
+          return "badge-warning";
+        }
+        if (statusClass === "status-critical") {
+          return "badge-critical";
+        }
+        return "badge-unknown";
       }
 
       var source = new EventSource("/events");
@@ -759,6 +836,19 @@ const indexTemplate = `<!doctype html>
           warningEl.textContent = payload.warning_count;
           criticalEl.textContent = payload.critical_count;
           unknownEl.textContent = payload.unknown_count;
+          plannedEl.textContent = payload.planned_count;
+          runningEl.textContent = payload.running_count;
+          overallEl.textContent = payload.overall_label;
+          overallEl.className = "badge " + statusBadge(payload.overall_class);
+          var delta = payload.error_count - lastErrors;
+          if (delta > 0) {
+            trendEl.textContent = "↑ " + delta;
+          } else if (delta < 0) {
+            trendEl.textContent = "↓ " + Math.abs(delta);
+          } else {
+            trendEl.textContent = "";
+          }
+          lastErrors = payload.error_count;
           connectionEl.textContent = "Live updates connected.";
         } catch (err) {
           connectionEl.textContent = "Live updates received malformed data.";
@@ -797,6 +887,7 @@ const indexTemplate = `<!doctype html>
       <div class="guest {{.StatusClass}}">
         <h4>{{.Name}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></h4>
         {{if .Address}}<div class="meta">Address: {{.Address}}</div>{{end}}
+        {{if .OSName}}<div class="meta">OS: {{.OSLogo}} {{.OSName}} {{.OSVersion}}</div>{{end}}
         {{template "services" .}}
         {{template "guests" .}}
       </div>

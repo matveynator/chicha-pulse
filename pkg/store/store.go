@@ -43,6 +43,19 @@ type unsubscribeRequest struct {
 	stream chan model.Inventory
 }
 
+type hostMetaRequest struct {
+	hostName       string
+	defaultGateway string
+	detectedParent string
+	osName         string
+	osVersion      string
+	osLogo         string
+}
+
+type activityRequest struct {
+	stats model.ActivityStats
+}
+
 // ---- Store ----
 
 // Store keeps the inventory inside one goroutine so callers never race over shared state.
@@ -54,6 +67,8 @@ type Store struct {
 	groupAssigns  chan assignRequest
 	subscribes    chan subscribeRequest
 	unsubscribes  chan unsubscribeRequest
+	hostMeta      chan hostMetaRequest
+	activity      chan activityRequest
 }
 
 // New creates the store and starts the loop that owns the inventory.
@@ -66,6 +81,8 @@ func New(ctx context.Context) *Store {
 		groupAssigns:  make(chan assignRequest),
 		subscribes:    make(chan subscribeRequest),
 		unsubscribes:  make(chan unsubscribeRequest),
+		hostMeta:      make(chan hostMetaRequest),
+		activity:      make(chan activityRequest),
 	}
 	go st.run(ctx)
 	return st
@@ -149,6 +166,33 @@ func (st *Store) Subscribe(ctx context.Context) (<-chan model.Inventory, func())
 	}
 }
 
+// UpdateHostMeta records metadata discovered via SSH so the topology stays current.
+func (st *Store) UpdateHostMeta(ctx context.Context, name, defaultGateway, detectedParent, osName, osVersion, osLogo string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case st.hostMeta <- hostMetaRequest{
+		hostName:       name,
+		defaultGateway: defaultGateway,
+		detectedParent: detectedParent,
+		osName:         osName,
+		osVersion:      osVersion,
+		osLogo:         osLogo,
+	}:
+		return nil
+	}
+}
+
+// UpdateActivity stores live scheduling stats so the UI can render real-time counts.
+func (st *Store) UpdateActivity(ctx context.Context, stats model.ActivityStats) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case st.activity <- activityRequest{stats: stats}:
+		return nil
+	}
+}
+
 // ---- Internal loop ----
 
 func (st *Store) run(ctx context.Context) {
@@ -193,6 +237,21 @@ func (st *Store) run(ctx context.Context) {
 				delete(subscribers, request.stream)
 				close(request.stream)
 			}
+		case meta := <-st.hostMeta:
+			host, ok := inventory.Hosts[meta.hostName]
+			if !ok {
+				host = &model.Host{Name: meta.hostName}
+				inventory.Hosts[meta.hostName] = host
+			}
+			host.DefaultGateway = meta.defaultGateway
+			host.DetectedParent = meta.detectedParent
+			host.OSName = meta.osName
+			host.OSVersion = meta.osVersion
+			host.OSLogo = meta.osLogo
+			publishSnapshot(inventory, subscribers)
+		case stats := <-st.activity:
+			inventory.Activity = stats.stats
+			publishSnapshot(inventory, subscribers)
 		}
 	}
 }

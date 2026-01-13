@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"chicha-pulse/pkg/activity"
 	"chicha-pulse/pkg/alert"
 	"chicha-pulse/pkg/checker"
 	"chicha-pulse/pkg/model"
@@ -23,6 +24,7 @@ import (
 	"chicha-pulse/pkg/storage"
 	"chicha-pulse/pkg/store"
 	"chicha-pulse/pkg/tlsmanager"
+	"chicha-pulse/pkg/topology"
 	"chicha-pulse/pkg/web"
 
 	_ "chicha-pulse/pkg/localsql"
@@ -96,10 +98,12 @@ func main() {
 	}
 	defer closeDatabase(database)
 
-	results := checker.Start(ctx, st)
+	results, activityEvents := checker.Start(ctx, st)
 	alertInput, storageInput, statusInput := fanOutResults(ctx, results)
 	alertEvents := alert.Start(ctx, alertInput)
 	startStatusSink(ctx, st, statusInput)
+	startActivitySink(ctx, st, activity.Start(ctx, activityEvents))
+	topology.Start(ctx, st)
 
 	if config.TelegramToken != "" && config.TelegramChatID != "" {
 		notifier := notify.NewTelegram(config.TelegramToken, config.TelegramChatID)
@@ -286,6 +290,22 @@ func startStatusSink(ctx context.Context, st *store.Store, input <-chan checker.
 				}
 				status := modelStatus(result)
 				_ = st.UpdateStatus(ctx, statusKey(result), status)
+			}
+		}
+	}()
+}
+
+func startActivitySink(ctx context.Context, st *store.Store, input <-chan model.ActivityStats) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case stats, ok := <-input:
+				if !ok {
+					return
+				}
+				_ = st.UpdateActivity(ctx, stats)
 			}
 		}
 	}()

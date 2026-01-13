@@ -23,11 +23,16 @@ type Service struct {
 
 // Host models a system that can hold services and relate to parent systems.
 type Host struct {
-	Name     string
-	Address  string
-	Parents  []string
-	Group    string
-	Services []Service
+	Name           string
+	Address        string
+	Parents        []string
+	DetectedParent string
+	DefaultGateway string
+	OSName         string
+	OSVersion      string
+	OSLogo         string
+	Group          string
+	Services       []Service
 }
 
 // ServiceStatus stores the most recent check result for a service.
@@ -43,6 +48,13 @@ type Inventory struct {
 	Groups   map[string]struct{}
 	Statuses map[string]ServiceStatus
 	Commands map[string]string
+	Activity ActivityStats
+}
+
+// ActivityStats summarizes current check activity so the UI can show live state.
+type ActivityStats struct {
+	Planned int
+	Running int
 }
 
 // ---- Constructors ----
@@ -64,10 +76,15 @@ func (inv Inventory) Clone() Inventory {
 	clone := NewInventory()
 	for name, host := range inv.Hosts {
 		hostCopy := Host{
-			Name:    host.Name,
-			Address: host.Address,
-			Parents: append([]string(nil), host.Parents...),
-			Group:   host.Group,
+			Name:           host.Name,
+			Address:        host.Address,
+			Parents:        append([]string(nil), host.Parents...),
+			DetectedParent: host.DetectedParent,
+			DefaultGateway: host.DefaultGateway,
+			OSName:         host.OSName,
+			OSVersion:      host.OSVersion,
+			OSLogo:         host.OSLogo,
+			Group:          host.Group,
 		}
 		if len(host.Services) > 0 {
 			hostCopy.Services = make([]Service, len(host.Services))
@@ -84,5 +101,6 @@ func (inv Inventory) Clone() Inventory {
 	for name, command := range inv.Commands {
 		clone.Commands[name] = command
 	}
+	clone.Activity = inv.Activity
 	return clone
 }

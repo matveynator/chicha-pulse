@@ -1120,6 +1120,9 @@ func ensureLetsEncrypt(ctx context.Context, domain string, email string) error {
 	if strings.TrimSpace(email) == "" {
 		return fmt.Errorf("ssl email is required for Let's Encrypt")
 	}
+	if _, err := exec.LookPath("certbot"); err != nil {
+		return fmt.Errorf("certbot not found in PATH; install certbot or remove the TLS domain to proceed")
+	}
 	args := []string{
 		"certonly",
 		"--standalone",

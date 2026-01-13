@@ -98,6 +98,11 @@ func Run(ctx context.Context) (Settings, error) {
 		}
 	}
 	printExistingSettings(settings)
+	if len(settings.WebAllowIPs) > 0 && settings.WebAddress != "" {
+		if err := EnsureIptables(ctx, settings.WebAddress, settings.WebAllowIPs); err != nil {
+			return Settings{}, err
+		}
+	}
 
 	printSectionTitle("Nagios import", "Only new inventory is imported; existing items are kept.")
 	defaultNagios := fallbackValue(settings.ImportNagiosPath, "/etc/nagios4/nagios.cfg")
@@ -709,10 +714,14 @@ func loadSettings() (Settings, error) {
 		return Settings{}, err
 	}
 	parsed := parseKeyValues(string(data))
+	allowIPs := parseCSVList(parsed["web_allow_ips"])
+	if len(allowIPs) == 0 {
+		allowIPs = parseCSVList(parsed["web_allow_ip"])
+	}
 	return Settings{
 		ImportNagiosPath: parsed["import_nagios"],
 		WebAddress:       parsed["web_addr"],
-		WebAllowIPs:      parseCSVList(parsed["web_allow_ips"]),
+		WebAllowIPs:      allowIPs,
 		TelegramToken:    parsed["telegram_token"],
 		TelegramChatID:   parsed["telegram_chat_id"],
 		DatabaseDriver:   parsed["db_driver"],
@@ -950,10 +959,41 @@ FROM setup_settings ORDER BY updated_at DESC LIMIT 1`
 		&settings.DomainName,
 		&settings.SSLEmail,
 	); err != nil {
+		if isSchemaColumnMissing(err) {
+			return loadSettingsFromDBLegacy(db)
+		}
 		return Settings{}, err
 	}
 	settings.WebAllowIPs = parseCSVList(allowIPs)
 	return settings, nil
+}
+
+func loadSettingsFromDBLegacy(db *sql.DB) (Settings, error) {
+	// Fall back to older schema so upgrades keep existing values.
+	statement := `SELECT import_nagios, web_addr, web_allow_ip, telegram_token, telegram_chat_id, db_driver, db_dsn
+FROM setup_settings ORDER BY updated_at DESC LIMIT 1`
+	row := db.QueryRow(statement)
+	settings := Settings{}
+	var allowIP string
+	if err := row.Scan(
+		&settings.ImportNagiosPath,
+		&settings.WebAddress,
+		&allowIP,
+		&settings.TelegramToken,
+		&settings.TelegramChatID,
+		&settings.DatabaseDriver,
+		&settings.DatabaseDSN,
+	); err != nil {
+		return Settings{}, err
+	}
+	settings.WebAllowIPs = parseCSVList(allowIP)
+	return settings, nil
+}
+
+func isSchemaColumnMissing(err error) bool {
+	// Match common column-missing errors across drivers without vendor specifics.
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "no such column") || strings.Contains(message, "column") && strings.Contains(message, "does not exist")
 }
 
 func saveSettingsToDB(settings Settings) error {
@@ -980,6 +1020,9 @@ ssl_email TEXT,
 updated_at TEXT
 )`
 	if _, err := db.Exec(schema); err != nil {
+		return err
+	}
+	if err := ensureSetupSettingsColumns(db); err != nil {
 		return err
 	}
 	statement := fmt.Sprintf(`INSERT INTO setup_settings (
@@ -1011,6 +1054,28 @@ id, import_nagios, web_addr, web_allow_ips, telegram_token, telegram_chat_id, db
 		time.Now().UTC().Format(time.RFC3339Nano),
 	)
 	return err
+}
+
+func ensureSetupSettingsColumns(db *sql.DB) error {
+	// Best-effort schema upgrades keep existing installs working.
+	for _, statement := range []string{
+		"ALTER TABLE setup_settings ADD COLUMN web_allow_ips TEXT",
+		"ALTER TABLE setup_settings ADD COLUMN domain_name TEXT",
+		"ALTER TABLE setup_settings ADD COLUMN ssl_email TEXT",
+	} {
+		if _, err := db.Exec(statement); err != nil && !isAlterColumnIgnored(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func isAlterColumnIgnored(err error) bool {
+	// Ignore errors for columns that already exist across common SQL engines.
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "duplicate column") ||
+		strings.Contains(message, "already exists") ||
+		strings.Contains(message, "duplicate") && strings.Contains(message, "column")
 }
 
 func placeholder(driverName string, index int) string {
@@ -1065,7 +1130,11 @@ func ensureLetsEncrypt(ctx context.Context, domain string, email string) error {
 	}
 	cmd := exec.CommandContext(ctx, "certbot", args...)
 	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("certbot failed: %s", strings.TrimSpace(string(output)))
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			message = err.Error()
+		}
+		return fmt.Errorf("certbot failed: %s", message)
 	}
 	if err := ensureRenewCron(); err != nil {
 		return err

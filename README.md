@@ -76,8 +76,7 @@ One binary. One pulse.
 chicha-pulse can import Nagios configuration files with `-import-nagios`, run the
 checks on schedule, and notify a Telegram channel when service state changes. A
 web panel lists head machines, their virtual machines, and all services attached
-per host. Basic auth is enabled for the superadmin by default so the platform can
-evolve into a multi-user model later.
+per host. Web credentials are generated on startup and printed to the log.
 
 ### Supported Nagios objects
 
@@ -93,7 +92,6 @@ referenced in the Nagios file.
 ```bash
 go run . \
   -import-nagios /path/to/nagios \
-  -superadmin-pass "secret" \
   -telegram-token "<bot token>" \
   -telegram-chat-id "<chat id>"
 ```

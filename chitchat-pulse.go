@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"flag"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -29,8 +31,6 @@ import (
 type Configuration struct {
 	ImportNagiosPath string
 	WebAddress       string
-	SuperAdminUser   string
-	SuperAdminPass   string
 	PageTitle        string
 	CheckInterval    time.Duration
 	TelegramToken    string
@@ -83,10 +83,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	srv, err := web.NewServer(st, web.AuthConfig{
-		Username: config.SuperAdminUser,
-		Password: config.SuperAdminPass,
-	}, config.PageTitle)
+	auth := generateAuth()
+	log.Printf("web auth username: %s", auth.Username)
+	log.Printf("web auth password: %s", auth.Password)
+
+	srv, err := web.NewServer(st, auth, config.PageTitle)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -109,8 +110,6 @@ func parseFlags() Configuration {
 	config := Configuration{}
 	flag.StringVar(&config.ImportNagiosPath, "import-nagios", "", "Path to Nagios config directory")
 	flag.StringVar(&config.WebAddress, "web-addr", ":8080", "HTTP listen address")
-	flag.StringVar(&config.SuperAdminUser, "superadmin-user", "admin", "Superadmin username")
-	flag.StringVar(&config.SuperAdminPass, "superadmin-pass", "", "Superadmin password")
 	flag.StringVar(&config.PageTitle, "page-title", "chicha-pulse", "Dashboard title")
 	flag.DurationVar(&config.CheckInterval, "check-interval", 30*time.Second, "Interval between check runs")
 	flag.StringVar(&config.TelegramToken, "telegram-token", "", "Telegram bot token")
@@ -122,9 +121,6 @@ func parseFlags() Configuration {
 }
 
 func validateConfig(config Configuration) error {
-	if config.SuperAdminPass == "" {
-		return fmt.Errorf("superadmin-pass is required for initial access")
-	}
 	if config.ImportNagiosPath == "" {
 		return fmt.Errorf("import-nagios is required to bootstrap inventory")
 	}
@@ -190,6 +186,28 @@ func fanOutResults(ctx context.Context, input <-chan checker.Result) (<-chan che
 		}
 	}()
 	return alerts, storageStream
+}
+
+// ---- Web auth ----
+
+func generateAuth() web.AuthConfig {
+	return web.AuthConfig{
+		Username: randomToken(12),
+		Password: randomToken(32),
+	}
+}
+
+func randomToken(length int) string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	bytes := make([]byte, length)
+	_, err := rand.Read(bytes)
+	if err != nil {
+		return fmt.Sprintf("fallback-%d", time.Now().UnixNano())
+	}
+	for i := range bytes {
+		bytes[i] = alphabet[int(bytes[i])%len(alphabet)]
+	}
+	return string(bytes)
 }
 
 // ---- Cleanup ----

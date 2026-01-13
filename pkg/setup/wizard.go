@@ -201,6 +201,11 @@ func loadSettings() (Settings, error) {
 	}, nil
 }
 
+// LoadSettings exposes stored settings so non-interactive runs can reuse the last setup.
+func LoadSettings() (Settings, error) {
+	return loadSettings()
+}
+
 func saveSettings(settings Settings) error {
 	path := settingsPath()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"chicha-pulse/pkg/model"
+	"chicha-pulse/pkg/sshkeys"
 	"chicha-pulse/pkg/store"
 	"golang.org/x/crypto/ssh"
 )
@@ -327,7 +328,7 @@ func runSSHCheck(ctx context.Context, job Job, result Result) Result {
 		return result
 	}
 
-	config, err := sshConfig(job)
+	config, err := sshConfig(ctx, job)
 	if err != nil {
 		result.Status = 2
 		result.Output = err.Error()
@@ -497,18 +498,13 @@ func hostFromTarget(target string) string {
 	return target
 }
 
-func sshConfig(job Job) (*ssh.ClientConfig, error) {
-	keyPath := strings.TrimSpace(job.SSHKeyPath)
-	if keyPath == "" {
+func sshConfig(ctx context.Context, job Job) (*ssh.ClientConfig, error) {
+	authMethods, err := buildAuthMethods(ctx, job)
+	if err != nil {
+		return nil, err
+	}
+	if len(authMethods) == 0 {
 		return nil, fmt.Errorf("missing ssh key path")
-	}
-	keyData, err := os.ReadFile(keyPath)
-	if err != nil {
-		return nil, err
-	}
-	signer, err := ssh.ParsePrivateKey(keyData)
-	if err != nil {
-		return nil, err
 	}
 	user := job.SSHUser
 	if user == "" {
@@ -516,10 +512,53 @@ func sshConfig(job Job) (*ssh.ClientConfig, error) {
 	}
 	return &ssh.ClientConfig{
 		User:            user,
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		Auth:            authMethods,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         10 * time.Second,
 	}, nil
+}
+
+func buildAuthMethods(ctx context.Context, job Job) ([]ssh.AuthMethod, error) {
+	var authMethods []ssh.AuthMethod
+	if keyPath := strings.TrimSpace(job.SSHKeyPath); keyPath != "" {
+		keyData, err := os.ReadFile(keyPath)
+		if err != nil {
+			return nil, err
+		}
+		signer, err := ssh.ParsePrivateKey(keyData)
+		if err != nil {
+			return nil, err
+		}
+		authMethods = append(authMethods, ssh.PublicKeys(signer))
+	}
+	if len(authMethods) >= 3 {
+		return authMethods, nil
+	}
+	keyring, err := sshkeys.LoadKeyringFromSettings(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, record := range keyring {
+		signer, err := parseKeySigner(record.PrivateKey, record.Passphrase)
+		if err != nil {
+			continue
+		}
+		authMethods = append(authMethods, ssh.PublicKeys(signer))
+		if len(authMethods) >= 3 {
+			break
+		}
+	}
+	return authMethods, nil
+}
+
+func parseKeySigner(keyData []byte, passphrase []byte) (ssh.Signer, error) {
+	// Try both encrypted and unencrypted parsing so existing keys still work.
+	if len(passphrase) > 0 {
+		if signer, err := ssh.ParsePrivateKeyWithPassphrase(keyData, passphrase); err == nil {
+			return signer, nil
+		}
+	}
+	return ssh.ParsePrivateKey(keyData)
 }
 
 func runTCPCheck(ctx context.Context, job Job, result Result) Result {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 
 	"chicha-pulse/pkg/model"
 	"chicha-pulse/pkg/nagiosimport"
+	"chicha-pulse/pkg/sshkeys"
 )
 
 // Package setup provides an interactive wizard so the first run is self-guided.
@@ -92,6 +94,10 @@ func Run(ctx context.Context) (Settings, error) {
 	} else {
 		settings.DatabaseDSN = defaultSQLitePath(settings.WebAddress)
 		fmt.Printf("SQLite database path: %s\n", settings.DatabaseDSN)
+	}
+
+	if err := configureSSHKeys(ctx, reader, settings); err != nil {
+		return Settings{}, err
 	}
 
 	if settings.TelegramToken != "" && settings.TelegramChatID != "" {
@@ -177,6 +183,151 @@ func printBanner() {
 	fmt.Println(purple + "══════════════════════════════════════" + reset)
 	fmt.Println(cyan + "   chicha-pulse interactive setup" + reset)
 	fmt.Println(purple + "══════════════════════════════════════" + reset)
+}
+
+// ---- SSH key setup ----
+
+func configureSSHKeys(ctx context.Context, reader *bufio.Reader, settings Settings) error {
+	if err := sshkeys.EnsureKeyring(ctx, settings.DatabaseDriver, settings.DatabaseDSN); err != nil {
+		return err
+	}
+	if strings.TrimSpace(settings.DatabaseDriver) == "" || strings.TrimSpace(settings.DatabaseDSN) == "" {
+		fmt.Println("SSH key setup skipped: database not configured.")
+		return nil
+	}
+	if err := tightenSQLitePermissions(settings.DatabaseDriver, settings.DatabaseDSN); err != nil {
+		fmt.Fprintf(os.Stderr, "setup: sqlite permissions warning: %v\n", err)
+	}
+
+	fmt.Println("\nSSH key setup (up to 3 keys):")
+	for index := 1; index <= 3; index++ {
+		choice := prompt(reader, fmt.Sprintf("Key %d: enter private key path, 'g' to generate, or leave empty to skip: ", index), "")
+		if strings.TrimSpace(choice) == "" {
+			return nil
+		}
+		keyPath := strings.TrimSpace(choice)
+		if strings.EqualFold(keyPath, "g") {
+			generated, passphrase, publicKey, err := generateSSHKey()
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Generated SSH key: %s\n", generated)
+			fmt.Printf("Public key:\n%s\n", publicKey)
+			if err := saveSSHKey(ctx, settings, generated, passphrase, publicKey); err != nil {
+				return err
+			}
+		} else {
+			passphrase := promptPassphrase(reader, "Passphrase for this key (leave empty to keep none, or type 'g' to generate): ")
+			if strings.EqualFold(passphrase, "g") {
+				generatedPassphrase, err := randomPassphrase()
+				if err != nil {
+					return err
+				}
+				passphrase = generatedPassphrase
+				fmt.Printf("Generated passphrase: %s\n", passphrase)
+			}
+			publicKey, err := readPublicKey(ctx, keyPath)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Public key:\n%s\n", publicKey)
+			if err := saveSSHKey(ctx, settings, keyPath, passphrase, publicKey); err != nil {
+				return err
+			}
+		}
+		next := prompt(reader, "Add another SSH key? [y/N]: ", "N")
+		if strings.ToLower(next) != "y" {
+			return nil
+		}
+	}
+	return nil
+}
+
+func saveSSHKey(ctx context.Context, settings Settings, path, passphrase, publicKey string) error {
+	privateKey, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	label := filepath.Base(path)
+	return sshkeys.SaveKey(ctx, settings.DatabaseDriver, settings.DatabaseDSN, label, publicKey, privateKey, []byte(passphrase))
+}
+
+func generateSSHKey() (string, string, string, error) {
+	passphrase, err := randomPassphrase()
+	if err != nil {
+		return "", "", "", err
+	}
+	dir := "/var/lib/chicha-pulse/ssh"
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", "", "", err
+	}
+	path := filepath.Join(dir, fmt.Sprintf("id_ed25519_%d", time.Now().UnixNano()))
+	cmd := exec.Command("ssh-keygen", "-t", "ed25519", "-a", "64", "-f", path, "-N", passphrase)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return "", "", "", fmt.Errorf("ssh-keygen failed: %s", strings.TrimSpace(string(output)))
+	}
+	publicKeyBytes, err := os.ReadFile(path + ".pub")
+	if err != nil {
+		return "", "", "", err
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return "", "", "", err
+	}
+	return path, passphrase, strings.TrimSpace(string(publicKeyBytes)), nil
+}
+
+func readPublicKey(ctx context.Context, path string) (string, error) {
+	pubPath := path + ".pub"
+	if data, err := os.ReadFile(pubPath); err == nil {
+		return strings.TrimSpace(string(data)), nil
+	}
+	cmd := exec.CommandContext(ctx, "ssh-keygen", "-y", "-f", path)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("ssh-keygen -y failed: %s", strings.TrimSpace(string(output)))
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func promptPassphrase(reader *bufio.Reader, label string) string {
+	fmt.Print(label)
+	text, _ := reader.ReadString('\n')
+	return strings.TrimSpace(text)
+}
+
+func randomPassphrase() (string, error) {
+	// Use random bytes to make the passphrase hard to guess while still printable.
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	const length = 24
+	buf := make([]byte, length)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	for i := range buf {
+		buf[i] = letters[int(buf[i])%len(letters)]
+	}
+	return string(buf), nil
+}
+
+func tightenSQLitePermissions(driverName, dsn string) error {
+	if driverName != "sqlite" {
+		return nil
+	}
+	path := strings.TrimPrefix(dsn, "file:")
+	if path == "" {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if info.Mode().Perm() != 0o600 {
+		return os.Chmod(path, 0o600)
+	}
+	return nil
 }
 
 // ---- Settings persistence ----

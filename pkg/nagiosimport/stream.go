@@ -3,9 +3,7 @@ package nagiosimport
 import (
 	"bufio"
 	"context"
-	"errors"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,6 +37,20 @@ type Object struct {
 // Stream parses Nagios object files and streams parsed objects.
 // It owns the parsing goroutine so downstream code can consume data asynchronously.
 func Stream(ctx context.Context, root string) (<-chan Object, <-chan error) {
+	filePaths, err := ResolveConfigFiles(ctx, root)
+	if err != nil {
+		objectCh := make(chan Object)
+		errCh := make(chan error, 1)
+		close(objectCh)
+		errCh <- err
+		close(errCh)
+		return objectCh, errCh
+	}
+	return StreamFiles(ctx, filePaths)
+}
+
+// StreamFiles parses a list of object files and streams parsed objects.
+func StreamFiles(ctx context.Context, files []string) (<-chan Object, <-chan error) {
 	objectCh := make(chan Object)
 	errCh := make(chan error, 1)
 
@@ -46,52 +58,24 @@ func Stream(ctx context.Context, root string) (<-chan Object, <-chan error) {
 		defer close(objectCh)
 		defer close(errCh)
 
-		pathCh := make(chan string)
-		go func() {
-			defer close(pathCh)
-			walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
-				if err != nil {
-					return err
-				}
-				if entry.IsDir() {
-					return nil
-				}
-				if !strings.HasSuffix(entry.Name(), ".cfg") {
-					return nil
-				}
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case pathCh <- path:
-					return nil
-				}
-			})
-			if walkErr != nil && !errors.Is(walkErr, context.Canceled) {
-				errCh <- walkErr
-			}
-		}()
-
-		for {
+		for _, path := range files {
 			select {
 			case <-ctx.Done():
 				errCh <- ctx.Err()
 				return
-			case path, ok := <-pathCh:
-				if !ok {
+			default:
+			}
+			objects, err := parseFile(path)
+			if err != nil {
+				errCh <- err
+				continue
+			}
+			for _, obj := range objects {
+				select {
+				case <-ctx.Done():
+					errCh <- ctx.Err()
 					return
-				}
-				objects, err := parseFile(path)
-				if err != nil {
-					errCh <- err
-					continue
-				}
-				for _, obj := range objects {
-					select {
-					case <-ctx.Done():
-						errCh <- ctx.Err()
-						return
-					case objectCh <- obj:
-					}
+				case objectCh <- obj:
 				}
 			}
 		}
@@ -103,7 +87,7 @@ func Stream(ctx context.Context, root string) (<-chan Object, <-chan error) {
 // ---- Parsing helpers ----
 
 func parseFile(path string) ([]Object, error) {
-	file, err := os.Open(path)
+	file, err := os.Open(filepath.Clean(path))
 	if err != nil {
 		return nil, err
 	}
@@ -201,9 +185,11 @@ func buildObject(objectType string, data map[string]string) (Object, bool) {
 			return Object{}, false
 		}
 		service := model.Service{
-			Name:         serviceName,
-			CheckCommand: data["check_command"],
-			Notes:        data["notes"],
+			Name:                 serviceName,
+			CheckCommand:         data["check_command"],
+			Notes:                data["notes"],
+			NotificationsEnabled: data["notifications_enabled"] != "0",
+			Contacts:             splitList(data["contacts"]),
 		}
 		return Object{Kind: KindService, Service: service, HostNames: hostNames}, true
 	default:

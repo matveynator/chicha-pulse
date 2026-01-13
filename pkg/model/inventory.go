@@ -6,10 +6,12 @@ package model
 
 // Service describes a single Nagios-like check that runs on a host.
 type Service struct {
-	Name         string
-	CheckCommand string
-	HostName     string
-	Notes        string
+	Name                 string
+	CheckCommand         string
+	HostName             string
+	Notes                string
+	NotificationsEnabled bool
+	Contacts             []string
 }
 
 // Host models a system that can hold services and relate to parent systems.

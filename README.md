@@ -78,10 +78,16 @@ checks on schedule, and notify a Telegram channel when service state changes. A
 web panel lists head machines, their virtual machines, and all services attached
 per host. Web credentials are generated on startup and printed to the log.
 
+### Interactive setup
+
+Run `-setup` to walk through configuration interactively with a colorized menu.
+The wizard finds Nagios configs, summarizes them, and asks before import.
+
 ### Supported Nagios objects
 
 - `host` with `host_name`, `address`, and optional `parents`.
-- `service` with `service_description`, `host_name`, and `check_command`.
+- `service` with `service_description`, `host_name`, `check_command`, and
+  optional `contacts` and `notifications_enabled`.
 
 Hosts without parents are shown as head machines. Hosts that declare a parent are
 shown as virtual machines under that head. Services are attached to each host
@@ -90,10 +96,7 @@ referenced in the Nagios file.
 ### Example
 
 ```bash
-go run . \
-  -import-nagios /path/to/nagios \
-  -telegram-token "<bot token>" \
-  -telegram-chat-id "<chat id>"
+go run . -setup
 ```
 
 ### Database

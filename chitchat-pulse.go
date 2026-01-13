@@ -16,6 +16,7 @@ import (
 	"chicha-pulse/pkg/checker"
 	"chicha-pulse/pkg/nagiosimport"
 	"chicha-pulse/pkg/notify"
+	"chicha-pulse/pkg/setup"
 	"chicha-pulse/pkg/storage"
 	"chicha-pulse/pkg/store"
 	"chicha-pulse/pkg/web"
@@ -37,18 +38,28 @@ type Configuration struct {
 	TelegramChatID   string
 	DatabaseDriver   string
 	DatabaseDSN      string
+	SetupMode        bool
 }
 
 // ---- Entry point ----
 func main() {
 	config := parseFlags()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if config.SetupMode {
+		settings, err := setup.Run(ctx)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		config = applySettings(config, settings)
+	}
+
 	if err := validateConfig(config); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	st := store.New(ctx)
 	if err := runImport(ctx, st, config.ImportNagiosPath); err != nil {
@@ -67,15 +78,14 @@ func main() {
 	alertInput, storageInput := fanOutResults(ctx, results)
 	alertEvents := alert.Start(ctx, alertInput)
 
-	notifier := notify.NewTelegram(config.TelegramToken, config.TelegramChatID)
-	if err := notifier.Validate(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-
-	if err := notify.Start(ctx, notifier, alertEvents); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	if config.TelegramToken != "" && config.TelegramChatID != "" {
+		notifier := notify.NewTelegram(config.TelegramToken, config.TelegramChatID)
+		if err := notify.Start(ctx, notifier, alertEvents); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	} else {
+		log.Printf("telegram notifications disabled")
 	}
 
 	if err := storage.Start(ctx, database, storageInput); err != nil {
@@ -108,7 +118,7 @@ func main() {
 
 func parseFlags() Configuration {
 	config := Configuration{}
-	flag.StringVar(&config.ImportNagiosPath, "import-nagios", "", "Path to Nagios config directory")
+	flag.StringVar(&config.ImportNagiosPath, "import-nagios", "", "Path to Nagios config directory or nagios.cfg")
 	flag.StringVar(&config.WebAddress, "web-addr", ":8080", "HTTP listen address")
 	flag.StringVar(&config.PageTitle, "page-title", "chicha-pulse", "Dashboard title")
 	flag.DurationVar(&config.CheckInterval, "check-interval", 30*time.Second, "Interval between check runs")
@@ -116,6 +126,7 @@ func parseFlags() Configuration {
 	flag.StringVar(&config.TelegramChatID, "telegram-chat-id", "", "Telegram chat ID for notifications")
 	flag.StringVar(&config.DatabaseDriver, "db-driver", "sqlite", "Database driver (sqlite or postgres)")
 	flag.StringVar(&config.DatabaseDSN, "db-dsn", "file:chicha-pulse.db", "Database DSN")
+	flag.BoolVar(&config.SetupMode, "setup", false, "Run interactive setup")
 	flag.Parse()
 	return config
 }
@@ -125,6 +136,16 @@ func validateConfig(config Configuration) error {
 		return fmt.Errorf("import-nagios is required to bootstrap inventory")
 	}
 	return nil
+}
+
+func applySettings(config Configuration, settings setup.Settings) Configuration {
+	config.ImportNagiosPath = settings.ImportNagiosPath
+	config.WebAddress = settings.WebAddress
+	config.TelegramToken = settings.TelegramToken
+	config.TelegramChatID = settings.TelegramChatID
+	config.DatabaseDriver = settings.DatabaseDriver
+	config.DatabaseDSN = settings.DatabaseDSN
+	return config
 }
 
 // ---- Import pipeline ----

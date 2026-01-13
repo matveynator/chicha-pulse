@@ -243,7 +243,6 @@ func runCheck(ctx context.Context, job Job) Result {
 		CheckCommand: job.CheckCommand,
 		CheckedAt:    time.Now(),
 	}
-	log.Printf("session=%d host=%s service=%s seq=%d step=start", job.SessionID, job.HostName, job.ServiceName, job.Sequence)
 	if !job.HostReachable && !needsSSH {
 		result.Status = 2
 		result.Output = "host unreachable (ping failed)"
@@ -270,7 +269,6 @@ func runCheck(ctx context.Context, job Job) Result {
 		return runTCPCheck(ctx, job, result)
 	}
 
-	log.Printf("session=%d host=%s service=%s seq=%d step=exec command=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, command)
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
 	output, err := cmd.CombinedOutput()
 	result.Output = strings.TrimSpace(string(output))
@@ -309,7 +307,6 @@ func runSSHCheck(ctx context.Context, job Job, result Result) Result {
 		remoteCommand = "uptime"
 	}
 	remoteCommand = expandCommand(remoteCommand, job)
-	log.Printf("session=%d host=%s service=%s seq=%d step=ssh-start address=%s port=%d user=%s command=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, address, port, job.SSHUser, remoteCommand)
 
 	if !job.HostReachable {
 		if err := preflightTCP(ctx, address, port, "ssh", job.SessionID); err != nil {
@@ -335,7 +332,8 @@ func runSSHCheck(ctx context.Context, job Job, result Result) Result {
 		log.Printf("session=%d host=%s service=%s seq=%d step=ssh-connect-fail address=%s port=%d err=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, address, port, result.Output)
 		return result
 	}
-	client, err := ssh.Dial("tcp", net.JoinHostPort(address, fmt.Sprintf("%d", port)), config)
+	log.Printf("session=%d host=%s service=%s seq=%d step=ssh-auth address=%s port=%d user=%s keys=%s", job.SessionID, job.HostName, job.ServiceName, job.Sequence, address, port, config.client.User, strings.Join(config.authSources, ","))
+	client, err := ssh.Dial("tcp", net.JoinHostPort(address, fmt.Sprintf("%d", port)), config.client)
 	if err != nil {
 		result.Status = 2
 		result.Output = err.Error()
@@ -343,7 +341,6 @@ func runSSHCheck(ctx context.Context, job Job, result Result) Result {
 		return result
 	}
 	defer client.Close()
-	log.Printf("session=%d host=%s service=%s seq=%d step=ssh-connect-ok address=%s port=%d", job.SessionID, job.HostName, job.ServiceName, job.Sequence, address, port)
 
 	session, err := client.NewSession()
 	if err != nil {
@@ -381,8 +378,7 @@ func runLegacySSHCheck(ctx context.Context, job Job, result Result, command stri
 		return result
 	}
 	remoteCommand = expandCommand(remoteCommand, job)
-	host := hostFromTarget(target)
-	log.Printf("session=%d host=%s service=%s seq=%d step=ssh-legacy-start target=%s command=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, target, remoteCommand)
+	user, host := parseTargetUserHost(target)
 	if !job.HostReachable {
 		if err := preflightTCP(ctx, host, 22, "ssh", job.SessionID); err != nil {
 			result.Status = 2
@@ -399,19 +395,41 @@ func runLegacySSHCheck(ctx context.Context, job Job, result Result, command stri
 		result.Output = err.Error()
 		return result
 	}
-	cmd := exec.CommandContext(ctx, "ssh", target, remoteCommand)
-	output, err := cmd.CombinedOutput()
+
+	config, err := sshConfigForUser(ctx, job, user)
+	if err != nil {
+		result.Status = 2
+		result.Output = err.Error()
+		log.Printf("session=%d host=%s service=%s seq=%d step=ssh-legacy-connect-fail target=%s err=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, target, result.Output)
+		return result
+	}
+	log.Printf("session=%d host=%s service=%s seq=%d step=ssh-legacy-auth target=%s keys=%s", job.SessionID, job.HostName, job.ServiceName, job.Sequence, target, strings.Join(config.authSources, ","))
+	client, err := ssh.Dial("tcp", net.JoinHostPort(host, "22"), config.client)
+	if err != nil {
+		result.Status = 2
+		result.Output = err.Error()
+		log.Printf("session=%d host=%s service=%s seq=%d step=ssh-legacy-connect-fail target=%s err=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, target, result.Output)
+		return result
+	}
+	defer client.Close()
+
+	session, err := client.NewSession()
+	if err != nil {
+		result.Status = 2
+		result.Output = err.Error()
+		log.Printf("session=%d host=%s service=%s seq=%d step=ssh-legacy-exec-fail target=%s err=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, target, result.Output)
+		return result
+	}
+	defer session.Close()
+
+	output, err := session.CombinedOutput(remoteCommand)
 	result.Output = strings.TrimSpace(string(output))
 	if err != nil {
-		exitCode := cmd.ProcessState.ExitCode()
-		if exitCode == -1 {
-			exitCode = 2
-		}
-		result.Status = exitCode
+		result.Status = 2
 		if result.Output == "" {
 			result.Output = err.Error()
 		}
-		log.Printf("session=%d host=%s service=%s seq=%d step=ssh-legacy-error target=%s status=%d output=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, target, result.Status, result.Output)
+		log.Printf("session=%d host=%s service=%s seq=%d step=ssh-legacy-exec-fail target=%s output=%q", job.SessionID, job.HostName, job.ServiceName, job.Sequence, target, result.Output)
 		return result
 	}
 	result.Status = 0
@@ -489,54 +507,75 @@ func normalizeRemoteCommand(command string) string {
 	return unescaped
 }
 
-func hostFromTarget(target string) string {
-	// Split user@host so TCP preflight checks the real host.
+func parseTargetUserHost(target string) (string, string) {
+	// Split user@host so legacy commands can reuse the SSH client config.
 	if strings.Contains(target, "@") {
 		parts := strings.SplitN(target, "@", 2)
-		return parts[1]
+		return parts[0], parts[1]
 	}
-	return target
+	return "", target
 }
 
-func sshConfig(ctx context.Context, job Job) (*ssh.ClientConfig, error) {
-	authMethods, err := buildAuthMethods(ctx, job)
+type sshConfigResult struct {
+	client      *ssh.ClientConfig
+	authSources []string
+}
+
+func sshConfig(ctx context.Context, job Job) (sshConfigResult, error) {
+	authMethods, authSources, err := buildAuthMethods(ctx, job)
 	if err != nil {
-		return nil, err
+		return sshConfigResult{}, err
 	}
 	if len(authMethods) == 0 {
-		return nil, fmt.Errorf("missing ssh key path")
+		return sshConfigResult{}, fmt.Errorf("missing ssh keys")
 	}
 	user := job.SSHUser
 	if user == "" {
 		user = "root"
 	}
-	return &ssh.ClientConfig{
-		User:            user,
-		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         10 * time.Second,
+	return sshConfigResult{
+		client: &ssh.ClientConfig{
+			User:            user,
+			Auth:            authMethods,
+			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+			Timeout:         10 * time.Second,
+		},
+		authSources: authSources,
 	}, nil
 }
 
-func buildAuthMethods(ctx context.Context, job Job) ([]ssh.AuthMethod, error) {
+func sshConfigForUser(ctx context.Context, job Job, user string) (sshConfigResult, error) {
+	config, err := sshConfig(ctx, job)
+	if err != nil {
+		return sshConfigResult{}, err
+	}
+	if strings.TrimSpace(user) != "" {
+		config.client.User = user
+	}
+	return config, nil
+}
+
+func buildAuthMethods(ctx context.Context, job Job) ([]ssh.AuthMethod, []string, error) {
 	var authMethods []ssh.AuthMethod
+	var authSources []string
 	if keyPath := strings.TrimSpace(job.SSHKeyPath); keyPath != "" {
 		keyData, err := os.ReadFile(keyPath)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		signer, err := ssh.ParsePrivateKey(keyData)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		authMethods = append(authMethods, ssh.PublicKeys(signer))
+		authSources = append(authSources, "path:"+keyPath)
 	}
 	if len(authMethods) >= 3 {
-		return authMethods, nil
+		return authMethods, authSources, nil
 	}
 	keyring, err := sshkeys.LoadKeyringFromSettings(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for _, record := range keyring {
 		signer, err := parseKeySigner(record.PrivateKey, record.Passphrase)
@@ -544,11 +583,12 @@ func buildAuthMethods(ctx context.Context, job Job) ([]ssh.AuthMethod, error) {
 			continue
 		}
 		authMethods = append(authMethods, ssh.PublicKeys(signer))
+		authSources = append(authSources, "keyring:"+record.Label)
 		if len(authMethods) >= 3 {
 			break
 		}
 	}
-	return authMethods, nil
+	return authMethods, authSources, nil
 }
 
 func parseKeySigner(keyData []byte, passphrase []byte) (ssh.Signer, error) {
@@ -573,7 +613,6 @@ func runTCPCheck(ctx context.Context, job Job, result Result) Result {
 		log.Printf("session=%d host=%s service=%s seq=%d step=blocked reason=missing_port", job.SessionID, job.HostName, job.ServiceName, job.Sequence)
 		return result
 	}
-	log.Printf("session=%d host=%s service=%s seq=%d step=tcp-start address=%s port=%s", job.SessionID, job.HostName, job.ServiceName, job.Sequence, address, port)
 	portNumber := parsePort(port)
 	if err := preflightTCP(ctx, address, portNumber, "tcp", job.SessionID); err != nil {
 		result.Status = 2

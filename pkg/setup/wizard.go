@@ -83,9 +83,34 @@ func Run(ctx context.Context) (Settings, error) {
 	}
 
 	fmt.Printf("\nFound Nagios: %d hosts, %d services, %d notifications (from %s).\n", summary.Hosts, summary.Services, summary.Notifications, summary.ConfigFileHint)
-	confirm := prompt(reader, "Import this configuration? [Y/n]: ", "Y")
+	previousSummary, hasPrevious, err := loadImportSummary()
+	if err != nil {
+		return Settings{}, err
+	}
+	if hasPrevious {
+		fmt.Printf("Previously imported: %d hosts, %d services, %d notifications (from %s).\n", previousSummary.Hosts, previousSummary.Services, previousSummary.Notifications, previousSummary.ConfigPath)
+	}
+	delta := buildImportDelta(summary, previousSummary, hasPrevious)
+	confirm := "Y"
+	if hasPrevious && delta.HasNoNew {
+		confirm = prompt(reader, "No new inventory since last import. Skip import? [Y/n]: ", "Y")
+		if strings.ToLower(confirm) == "n" {
+			confirm = "Y"
+		} else {
+			confirm = "SKIP"
+		}
+	} else if hasPrevious {
+		confirm = prompt(reader, fmt.Sprintf("Import new inventory? (+%d hosts, +%d services, +%d notifications) [Y/n]: ", delta.AddedHosts, delta.AddedServices, delta.AddedNotifications), "Y")
+	} else {
+		confirm = prompt(reader, "Import this configuration? [Y/n]: ", "Y")
+	}
 	if strings.ToLower(confirm) == "n" {
 		return Settings{}, fmt.Errorf("import cancelled by user")
+	}
+	if confirm != "SKIP" {
+		if err := saveImportSummary(summary); err != nil {
+			return Settings{}, err
+		}
 	}
 
 	settings.ImportNagiosPath = path
@@ -232,6 +257,13 @@ func redactToken(token string) string {
 		return "***"
 	}
 	return trimmed[:3] + "***" + trimmed[len(trimmed)-3:]
+}
+
+type importDelta struct {
+	AddedHosts         int
+	AddedServices      int
+	AddedNotifications int
+	HasNoNew           bool
 }
 
 // ---- SSH key setup ----
@@ -452,6 +484,11 @@ func settingsPath() string {
 	return "/var/lib/chicha-pulse/settings.conf"
 }
 
+func importSummaryPath() string {
+	// Keep import metadata alongside settings for easy inspection.
+	return "/var/lib/chicha-pulse/import_summary.json"
+}
+
 func loadSettings() (Settings, error) {
 	data, err := os.ReadFile(settingsPath())
 	if err != nil {
@@ -544,6 +581,64 @@ func mergeSettings(base, override Settings) Settings {
 		merged.DatabaseDSN = override.DatabaseDSN
 	}
 	return merged
+}
+
+func loadImportSummary() (Summary, bool, error) {
+	// Load the last import summary so setup can detect new inventory.
+	data, err := os.ReadFile(importSummaryPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return Summary{}, false, nil
+		}
+		return Summary{}, false, err
+	}
+	var summary Summary
+	if err := json.Unmarshal(data, &summary); err != nil {
+		return Summary{}, false, err
+	}
+	return summary, true, nil
+}
+
+func saveImportSummary(summary Summary) error {
+	// Persist the summary so later runs can compute deltas.
+	if err := os.MkdirAll(filepath.Dir(importSummaryPath()), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(summary, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(importSummaryPath(), data, 0o600)
+}
+
+func buildImportDelta(current Summary, previous Summary, hasPrevious bool) importDelta {
+	// Track added inventory so setup can avoid unnecessary re-import prompts.
+	if !hasPrevious || previous.ConfigFileHint != current.ConfigFileHint {
+		return importDelta{
+			AddedHosts:         current.Hosts,
+			AddedServices:      current.Services,
+			AddedNotifications: current.Notifications,
+			HasNoNew:           false,
+		}
+	}
+	addedHosts := current.Hosts - previous.Hosts
+	if addedHosts < 0 {
+		addedHosts = 0
+	}
+	addedServices := current.Services - previous.Services
+	if addedServices < 0 {
+		addedServices = 0
+	}
+	addedNotifications := current.Notifications - previous.Notifications
+	if addedNotifications < 0 {
+		addedNotifications = 0
+	}
+	return importDelta{
+		AddedHosts:         addedHosts,
+		AddedServices:      addedServices,
+		AddedNotifications: addedNotifications,
+		HasNoNew:           addedHosts == 0 && addedServices == 0 && addedNotifications == 0,
+	}
 }
 
 func loadSettingsFromDB(driverName, dsn string) (Settings, error) {

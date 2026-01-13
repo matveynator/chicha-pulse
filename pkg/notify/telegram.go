@@ -99,9 +99,12 @@ func Start(ctx context.Context, sender Sender, alerts <-chan alert.Event) error 
 }
 
 func formatMessage(event alert.Event) string {
-	statusLabel := "OK"
-	if event.Status != 0 {
-		statusLabel = fmt.Sprintf("FAIL (%d)", event.Status)
+	// Emit recovery only when a failure returns to OK.
+	if event.Recovered {
+		return fmt.Sprintf("RECOVERY on %s/%s: %s", event.HostName, event.ServiceName, event.Output)
 	}
-	return fmt.Sprintf("%s on %s: %s", statusLabel, event.HostName, event.Output)
+	if event.Status == 0 {
+		return fmt.Sprintf("OK on %s/%s: %s", event.HostName, event.ServiceName, event.Output)
+	}
+	return fmt.Sprintf("FAIL (%d) on %s/%s: %s", event.Status, event.HostName, event.ServiceName, event.Output)
 }

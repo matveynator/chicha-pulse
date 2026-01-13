@@ -2,6 +2,9 @@ package web
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"html/template"
 	"net"
 	"net/http"
@@ -26,11 +29,13 @@ type AuthConfig struct {
 // ---- Server ----
 
 type Server struct {
-	store     *store.Store
-	auth      AuthConfig
-	template  *template.Template
-	pageTitle string
-	allowIPs  []string
+	store          *store.Store
+	auth           AuthConfig
+	template       *template.Template
+	alertsTemplate *template.Template
+	hostsTemplate  *template.Template
+	pageTitle      string
+	allowIPs       []string
 }
 
 // NewServer prepares the HTTP handler so the caller can run it with a standard net/http server.
@@ -38,12 +43,20 @@ func NewServer(st *store.Store, auth AuthConfig, pageTitle string, allowIPs []st
 	page := template.Must(template.New("index").Funcs(template.FuncMap{
 		"statusBadge": statusBadge,
 	}).Parse(indexTemplate))
+	alerts := template.Must(template.New("alerts").Funcs(template.FuncMap{
+		"statusBadge": statusBadge,
+	}).Parse(alertsTemplate))
+	hosts := template.Must(template.New("hosts").Funcs(template.FuncMap{
+		"statusBadge": statusBadge,
+	}).Parse(hostsTemplate))
 	return &Server{
-		store:     st,
-		auth:      auth,
-		template:  page,
-		pageTitle: pageTitle,
-		allowIPs:  append([]string(nil), allowIPs...),
+		store:          st,
+		auth:           auth,
+		template:       page,
+		alertsTemplate: alerts,
+		hostsTemplate:  hosts,
+		pageTitle:      pageTitle,
+		allowIPs:       append([]string(nil), allowIPs...),
 	}, nil
 }
 
@@ -51,6 +64,9 @@ func NewServer(st *store.Store, auth AuthConfig, pageTitle string, allowIPs []st
 func (srv *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleIndex)
+	mux.HandleFunc("/events/stats", srv.handleStatsEvents)
+	mux.HandleFunc("/events/alerts", srv.handleAlertsEvents)
+	mux.HandleFunc("/events/hosts", srv.handleHostsEvents)
 	mux.HandleFunc("/groups", srv.handleAddGroup)
 	mux.HandleFunc("/assign", srv.handleAssignGroup)
 	return srv.basicAuth(mux)
@@ -69,6 +85,140 @@ func (srv *Server) handleIndex(writer http.ResponseWriter, request *http.Request
 	view := buildView(snapshot, srv.pageTitle)
 	if err := srv.template.Execute(writer, view); err != nil {
 		http.Error(writer, "failed to render", http.StatusInternalServerError)
+	}
+}
+
+func (srv *Server) handleStatsEvents(writer http.ResponseWriter, request *http.Request) {
+	flusher, ok := writer.(http.Flusher)
+	if !ok {
+		http.Error(writer, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	// Use SSE so the UI can update without reloading the full page.
+	writer.Header().Set("Content-Type", "text/event-stream")
+	writer.Header().Set("Cache-Control", "no-cache")
+	writer.Header().Set("Connection", "keep-alive")
+
+	ctx := request.Context()
+	stream, stop := srv.store.Subscribe(ctx)
+	defer stop()
+
+	keepAlive := time.NewTicker(15 * time.Second)
+	defer keepAlive.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-keepAlive.C:
+			fmt.Fprint(writer, ": keep-alive\n\n")
+			flusher.Flush()
+		case snapshot, ok := <-stream:
+			if !ok {
+				return
+			}
+			payload := buildStatsPayload(snapshot)
+			data, err := json.Marshal(payload)
+			if err != nil {
+				return
+			}
+			fmt.Fprintf(writer, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+	}
+}
+
+func (srv *Server) handleAlertsEvents(writer http.ResponseWriter, request *http.Request) {
+	flusher, ok := writer.(http.Flusher)
+	if !ok {
+		http.Error(writer, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	// Use SSE so the UI can update the alerts list without reloading the page.
+	writer.Header().Set("Content-Type", "text/event-stream")
+	writer.Header().Set("Cache-Control", "no-cache")
+	writer.Header().Set("Connection", "keep-alive")
+
+	ctx := request.Context()
+	stream, stop := srv.store.Subscribe(ctx)
+	defer stop()
+
+	keepAlive := time.NewTicker(15 * time.Second)
+	defer keepAlive.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-keepAlive.C:
+			fmt.Fprint(writer, ": keep-alive\n\n")
+			flusher.Flush()
+		case snapshot, ok := <-stream:
+			if !ok {
+				return
+			}
+			html, err := srv.renderAlertsHTML(buildAlerts(snapshot))
+			if err != nil {
+				return
+			}
+			data, err := json.Marshal(map[string]string{"html": html})
+			if err != nil {
+				return
+			}
+			fmt.Fprintf(writer, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+	}
+}
+
+func (srv *Server) handleHostsEvents(writer http.ResponseWriter, request *http.Request) {
+	flusher, ok := writer.(http.Flusher)
+	if !ok {
+		http.Error(writer, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	// Use SSE so the UI can update host/service state without full reloads.
+	writer.Header().Set("Content-Type", "text/event-stream")
+	writer.Header().Set("Cache-Control", "no-cache")
+	writer.Header().Set("Connection", "keep-alive")
+
+	ctx := request.Context()
+	stream, stop := srv.store.Subscribe(ctx)
+	defer stop()
+
+	keepAlive := time.NewTicker(15 * time.Second)
+	defer keepAlive.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-keepAlive.C:
+			fmt.Fprint(writer, ": keep-alive\n\n")
+			flusher.Flush()
+		case snapshot, ok := <-stream:
+			if !ok {
+				return
+			}
+			parents, heads := buildParentHierarchy(snapshot)
+			var headViews []hostView
+			for _, host := range heads {
+				headViews = append(headViews, buildHostView(host, parents, snapshot))
+			}
+			sort.Slice(headViews, func(i, j int) bool {
+				return headViews[i].Name < headViews[j].Name
+			})
+			html, err := srv.renderHostsHTML(headViews, snapshot)
+			if err != nil {
+				return
+			}
+			data, err := json.Marshal(map[string]string{"html": html})
+			if err != nil {
+				return
+			}
+			fmt.Fprintf(writer, "data: %s\n\n", data)
+			flusher.Flush()
+		}
 	}
 }
 
@@ -158,6 +308,7 @@ func (srv *Server) isAllowedIP(request *http.Request) bool {
 type pageView struct {
 	Title         string
 	TotalServices int
+	Stats         statsView
 	Groups        []groupView
 	GroupNames    []string
 	Heads         []hostView
@@ -179,6 +330,9 @@ type hostView struct {
 	Name        string
 	Address     string
 	Group       string
+	OSName      string
+	OSVersion   string
+	OSLogo      string
 	StatusLabel string
 	StatusClass string
 	Services    []serviceView
@@ -207,20 +361,65 @@ type alertView struct {
 	CheckedAt   string
 }
 
+type statsView struct {
+	Total        int
+	Errors       int
+	Warning      int
+	Critical     int
+	Unknown      int
+	Planned      int
+	Running      int
+	OverallLabel string
+	OverallClass string
+}
+
+type statsPayload struct {
+	TotalServices int    `json:"total_services"`
+	ErrorCount    int    `json:"error_count"`
+	WarningCount  int    `json:"warning_count"`
+	CriticalCount int    `json:"critical_count"`
+	UnknownCount  int    `json:"unknown_count"`
+	PlannedCount  int    `json:"planned_count"`
+	RunningCount  int    `json:"running_count"`
+	OverallLabel  string `json:"overall_label"`
+	OverallClass  string `json:"overall_class"`
+}
+
+type alertsPayload struct {
+	Alerts []alertView
+}
+
+type hostsPayload struct {
+	Heads      []hostView
+	GroupNames []string
+}
+
+// ---- Template rendering ----
+
+func (srv *Server) renderAlertsHTML(alerts []alertView) (string, error) {
+	// Render just the alerts card so SSE updates stay lightweight.
+	var buffer strings.Builder
+	payload := buildAlertsPayload(alerts)
+	if err := srv.alertsTemplate.Execute(&buffer, payload); err != nil {
+		return "", err
+	}
+	return buffer.String(), nil
+}
+
+func (srv *Server) renderHostsHTML(heads []hostView, inventory model.Inventory) (string, error) {
+	// Render host hierarchy as a partial so the UI can swap it in-place.
+	var buffer strings.Builder
+	payload := buildHostsPayload(heads, inventory)
+	if err := srv.hostsTemplate.Execute(&buffer, payload); err != nil {
+		return "", err
+	}
+	return buffer.String(), nil
+}
+
 // ---- View helpers ----
 
 func buildView(inventory model.Inventory, title string) pageView {
-	parents := map[string][]*model.Host{}
-	var heads []*model.Host
-	for _, host := range inventory.Hosts {
-		if len(host.Parents) == 0 {
-			heads = append(heads, host)
-			continue
-		}
-		for _, parent := range host.Parents {
-			parents[parent] = append(parents[parent], host)
-		}
-	}
+	parents, heads := buildParentHierarchy(inventory)
 
 	var headViews []hostView
 	for _, host := range heads {
@@ -235,11 +434,53 @@ func buildView(inventory model.Inventory, title string) pageView {
 	return pageView{
 		Title:         title,
 		TotalServices: countServices(inventory),
+		Stats:         buildStats(inventory),
 		Groups:        groups,
 		GroupNames:    groupNames,
 		Heads:         headViews,
 		Alerts:        alerts,
 	}
+}
+
+func buildAlertsPayload(alerts []alertView) alertsPayload {
+	// Keep a stable structure for the alerts stream payload.
+	return alertsPayload{Alerts: alerts}
+}
+
+func buildHostsPayload(heads []hostView, inventory model.Inventory) hostsPayload {
+	// Include group names so the host assignment dropdown stays current.
+	_, groupNames := buildGroups(inventory)
+	return hostsPayload{
+		Heads:      heads,
+		GroupNames: groupNames,
+	}
+}
+
+func buildParentHierarchy(inventory model.Inventory) (map[string][]*model.Host, []*model.Host) {
+	// Prefer detected parents so live topology overrides static Nagios parents.
+	parents := map[string][]*model.Host{}
+	var heads []*model.Host
+	for _, host := range inventory.Hosts {
+		parentNames := resolveHostParents(host)
+		if len(parentNames) == 0 {
+			heads = append(heads, host)
+			continue
+		}
+		for _, parent := range parentNames {
+			parents[parent] = append(parents[parent], host)
+		}
+	}
+	return parents, heads
+}
+
+func resolveHostParents(host *model.Host) []string {
+	if strings.TrimSpace(host.DetectedParent) != "" {
+		return []string{host.DetectedParent}
+	}
+	if len(host.Parents) == 0 {
+		return nil
+	}
+	return append([]string(nil), host.Parents...)
 }
 
 func buildGroups(inventory model.Inventory) ([]groupView, []string) {
@@ -337,11 +578,77 @@ func buildHostView(host *model.Host, parents map[string][]*model.Host, inventory
 		Name:        host.Name,
 		Address:     host.Address,
 		Group:       host.Group,
+		OSName:      host.OSName,
+		OSVersion:   host.OSVersion,
+		OSLogo:      host.OSLogo,
 		StatusLabel: label,
 		StatusClass: class,
 		Services:    services,
 		Guests:      guests,
 	}
+}
+
+func buildStats(inventory model.Inventory) statsView {
+	// Count statuses by severity so the UI can show error breakdowns.
+	stats := statsView{}
+	for _, host := range inventory.Hosts {
+		for _, service := range host.Services {
+			stats.Total++
+			key := host.Name + "/" + service.Name
+			status, ok := inventory.Statuses[key]
+			if !ok {
+				stats.Unknown++
+				continue
+			}
+			switch status.Status {
+			case 0:
+				// OK results are not errors, but they still contribute to totals.
+			case 1:
+				stats.Warning++
+			case 2:
+				stats.Critical++
+			default:
+				stats.Unknown++
+			}
+		}
+	}
+	stats.Errors = stats.Warning + stats.Critical + stats.Unknown
+	stats.Planned = inventory.Activity.Planned
+	stats.Running = inventory.Activity.Running
+	stats.OverallLabel, stats.OverallClass = overallStatus(inventory)
+	return stats
+}
+
+func buildStatsPayload(inventory model.Inventory) statsPayload {
+	// Convert the internal stats struct into a stable JSON payload.
+	stats := buildStats(inventory)
+	return statsPayload{
+		TotalServices: stats.Total,
+		ErrorCount:    stats.Errors,
+		WarningCount:  stats.Warning,
+		CriticalCount: stats.Critical,
+		UnknownCount:  stats.Unknown,
+		PlannedCount:  stats.Planned,
+		RunningCount:  stats.Running,
+		OverallLabel:  stats.OverallLabel,
+		OverallClass:  stats.OverallClass,
+	}
+}
+
+func overallStatus(inventory model.Inventory) (string, string) {
+	// Summarize the worst status so the UI can color the live indicator.
+	worst := -1
+	for _, status := range inventory.Statuses {
+		label, _ := statusLabel(status.Status)
+		severity := statusSeverity(label)
+		if severity > worst {
+			worst = severity
+		}
+	}
+	if worst == -1 {
+		return "UNKNOWN", "status-unknown"
+	}
+	return statusLabelFromSeverity(worst)
 }
 
 func hostStatus(host *model.Host, inventory model.Inventory) (string, string) {
@@ -544,13 +851,28 @@ const indexTemplate = `<!doctype html>
     table { width: 100%; border-collapse: collapse; }
     th, td { padding: 0.5rem; border-bottom: 1px solid #eee; text-align: left; }
     form.inline { display: inline; }
+    .stats-row { display: flex; flex-wrap: wrap; gap: 1rem; }
+    .stats-item { min-width: 10rem; }
+    .live-indicator { font-weight: bold; color: #2c3e50; }
+    .trend { font-weight: bold; margin-left: 0.5rem; }
   </style>
 </head>
 <body>
   <h1>{{.Title}}</h1>
 
   <div class="card">
-    <strong>Total services:</strong> {{.TotalServices}}
+    <h2>Live task stats</h2>
+    <div class="stats-row">
+      <div class="stats-item"><strong>Total services:</strong> <span id="stat-total">{{.Stats.Total}}</span></div>
+      <div class="stats-item"><strong>Errors:</strong> <span id="stat-errors">{{.Stats.Errors}}</span><span id="stat-error-trend" class="trend"></span></div>
+      <div class="stats-item">Warning: <span id="stat-warning">{{.Stats.Warning}}</span></div>
+      <div class="stats-item">Critical: <span id="stat-critical">{{.Stats.Critical}}</span></div>
+      <div class="stats-item">Unknown: <span id="stat-unknown">{{.Stats.Unknown}}</span></div>
+      <div class="stats-item">Planned soon: <span id="stat-planned">{{.Stats.Planned}}</span></div>
+      <div class="stats-item">Running now: <span id="stat-running">{{.Stats.Running}}</span></div>
+      <div class="stats-item">Overall: <span id="stat-overall" class="badge {{statusBadge .Stats.OverallClass}}">{{.Stats.OverallLabel}}</span></div>
+    </div>
+    <div class="meta live-indicator" id="stat-connection">Live updates connected.</div>
   </div>
 
   <div class="card">
@@ -577,9 +899,104 @@ const indexTemplate = `<!doctype html>
     {{end}}
   </div>
 
-  <div class="card">
-    <h2>Recent alerts</h2>
-    {{if .Alerts}}
+  <div id="alerts-card">
+    {{template "alertsCard" .}}
+  </div>
+
+  <div id="hosts-tree">
+    {{template "hostsTree" .}}
+  </div>
+  <script>
+    (function () {
+      // Use SSE to update the stats card without reloading the page.
+      var totalEl = document.getElementById("stat-total");
+      var errorEl = document.getElementById("stat-errors");
+      var warningEl = document.getElementById("stat-warning");
+      var criticalEl = document.getElementById("stat-critical");
+      var unknownEl = document.getElementById("stat-unknown");
+      var plannedEl = document.getElementById("stat-planned");
+      var runningEl = document.getElementById("stat-running");
+      var overallEl = document.getElementById("stat-overall");
+      var connectionEl = document.getElementById("stat-connection");
+      var trendEl = document.getElementById("stat-error-trend");
+      var lastErrors = Number(errorEl.textContent) || 0;
+
+      if (!window.EventSource) {
+        connectionEl.textContent = "Live updates unavailable (EventSource not supported).";
+        return;
+      }
+
+      function statusBadge(statusClass) {
+        if (statusClass === "status-ok") {
+          return "badge-ok";
+        }
+        if (statusClass === "status-warning") {
+          return "badge-warning";
+        }
+        if (statusClass === "status-critical") {
+          return "badge-critical";
+        }
+        return "badge-unknown";
+      }
+
+      var source = new EventSource("/events/stats");
+      source.onmessage = function (event) {
+        try {
+          var payload = JSON.parse(event.data);
+          totalEl.textContent = payload.total_services;
+          errorEl.textContent = payload.error_count;
+          warningEl.textContent = payload.warning_count;
+          criticalEl.textContent = payload.critical_count;
+          unknownEl.textContent = payload.unknown_count;
+          plannedEl.textContent = payload.planned_count;
+          runningEl.textContent = payload.running_count;
+          overallEl.textContent = payload.overall_label;
+          overallEl.className = "badge " + statusBadge(payload.overall_class);
+          var delta = payload.error_count - lastErrors;
+          if (delta > 0) {
+            trendEl.textContent = "↑ " + delta;
+          } else if (delta < 0) {
+            trendEl.textContent = "↓ " + Math.abs(delta);
+          } else {
+            trendEl.textContent = "";
+          }
+          lastErrors = payload.error_count;
+          connectionEl.textContent = "Live updates connected.";
+        } catch (err) {
+          connectionEl.textContent = "Live updates received malformed data.";
+        }
+      };
+      source.onerror = function () {
+        connectionEl.textContent = "Live updates disconnected; retrying.";
+      };
+
+      var alertsSource = new EventSource("/events/alerts");
+      alertsSource.onmessage = function (event) {
+        try {
+          var payload = JSON.parse(event.data);
+          document.getElementById("alerts-card").innerHTML = payload.html;
+        } catch (err) {
+          connectionEl.textContent = "Live updates received malformed data.";
+        }
+      };
+
+      var hostsSource = new EventSource("/events/hosts");
+      hostsSource.onmessage = function (event) {
+        try {
+          var payload = JSON.parse(event.data);
+          document.getElementById("hosts-tree").innerHTML = payload.html;
+        } catch (err) {
+          connectionEl.textContent = "Live updates received malformed data.";
+        }
+      };
+    })();
+  </script>
+</body>
+</html>
+{{define "alertsCard"}}
+  {{if .Alerts}}
+    <div class="card">
+      <h2>Recent alerts</h2>
       <table>
         <thead>
           <tr><th>Status</th><th>Host</th><th>Service</th><th>Output</th><th>Checked</th></tr>
@@ -596,15 +1013,20 @@ const indexTemplate = `<!doctype html>
           {{end}}
         </tbody>
       </table>
-    {{else}}
+    </div>
+  {{else}}
+    <div class="card">
+      <h2>Recent alerts</h2>
       <div class="meta">No active alerts.</div>
-    {{end}}
-  </div>
-
+    </div>
+  {{end}}
+{{end}}
+{{define "hostsTree"}}
   {{range .Heads}}
     <div class="host {{.StatusClass}}">
       <h2>{{.Name}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></h2>
       {{if .Address}}<div class="meta">Address: {{.Address}}</div>{{end}}
+      {{if .OSName}}<div class="meta">OS: {{.OSLogo}} {{.OSName}} {{.OSVersion}}</div>{{end}}
       {{if $.GroupNames}}
         {{ $current := .Group }}
         <form class="inline" method="post" action="/assign">
@@ -623,8 +1045,7 @@ const indexTemplate = `<!doctype html>
   {{else}}
     <p>No hosts imported yet.</p>
   {{end}}
-</body>
-</html>
+{{end}}
 {{define "services"}}
   {{if .Services}}
     <h3>Services</h3>
@@ -651,6 +1072,7 @@ const indexTemplate = `<!doctype html>
       <div class="guest {{.StatusClass}}">
         <h4>{{.Name}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></h4>
         {{if .Address}}<div class="meta">Address: {{.Address}}</div>{{end}}
+        {{if .OSName}}<div class="meta">OS: {{.OSLogo}} {{.OSName}} {{.OSVersion}}</div>{{end}}
         {{template "services" .}}
         {{template "guests" .}}
       </div>
@@ -658,6 +1080,90 @@ const indexTemplate = `<!doctype html>
   {{end}}
 {{end}}
 `
+
+const alertsTemplate = `{{if .Alerts}}
+  <div class="card">
+    <h2>Recent alerts</h2>
+    <table>
+      <thead>
+        <tr><th>Status</th><th>Host</th><th>Service</th><th>Output</th><th>Checked</th></tr>
+      </thead>
+      <tbody>
+        {{range .Alerts}}
+          <tr>
+            <td><span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></td>
+            <td>{{.HostName}}</td>
+            <td>{{.ServiceName}}</td>
+            <td>{{.Output}}</td>
+            <td>{{.CheckedAt}}</td>
+          </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+{{else}}
+  <div class="card">
+    <h2>Recent alerts</h2>
+    <div class="meta">No active alerts.</div>
+  </div>
+{{end}}`
+
+const hostsTemplate = `{{range .Heads}}
+  <div class="host {{.StatusClass}}">
+    <h2>{{.Name}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></h2>
+    {{if .Address}}<div class="meta">Address: {{.Address}}</div>{{end}}
+    {{if .OSName}}<div class="meta">OS: {{.OSLogo}} {{.OSName}} {{.OSVersion}}</div>{{end}}
+    {{if $.GroupNames}}
+      {{ $current := .Group }}
+      <form class="inline" method="post" action="/assign">
+        <input type="hidden" name="host" value="{{.Name}}" />
+        <select name="group">
+          {{range $.GroupNames}}
+            <option value="{{.}}" {{if eq . $current}}selected{{end}}>{{.}}</option>
+          {{end}}
+        </select>
+        <button type="submit">Assign group</button>
+      </form>
+    {{end}}
+    {{template "services" .}}
+    {{template "guests" .}}
+  </div>
+{{else}}
+  <p>No hosts imported yet.</p>
+{{end}}
+{{define "services"}}
+  {{if .Services}}
+    <h3>Services</h3>
+    <ul class="services">
+      {{range .Services}}
+        <li>
+          <strong>{{.Name}}</strong>
+          <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span>
+          — {{.Command}}
+          {{if .Notes}} ({{.Notes}}){{end}}
+          {{if .Interval}}<span class="meta"> every {{.Interval}}m</span>{{end}}
+          {{if .SSHUser}}<span class="meta"> ssh {{.SSHUser}}</span>{{end}}
+          {{if .SSHKeyPath}}<span class="meta"> key {{.SSHKeyPath}}</span>{{end}}
+          {{if .CheckedAt}}<div class="meta">Checked: {{.CheckedAt}} — {{.Output}}</div>{{end}}
+        </li>
+      {{end}}
+    </ul>
+  {{end}}
+{{end}}
+{{define "guests"}}
+  {{if .Guests}}
+    <h3>Virtual machines</h3>
+    {{range .Guests}}
+      <div class="guest {{.StatusClass}}">
+        <h4>{{.Name}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></h4>
+        {{if .Address}}<div class="meta">Address: {{.Address}}</div>{{end}}
+        {{if .OSName}}<div class="meta">OS: {{.OSLogo}} {{.OSName}} {{.OSVersion}}</div>{{end}}
+        {{template "services" .}}
+        {{template "guests" .}}
+      </div>
+    {{end}}
+  {{end}}
+{{end}}`
 
 // ---- Template helpers ----
 
@@ -681,11 +1187,20 @@ func Run(ctx context.Context, server *http.Server) error {
 	shutdownErr := make(chan error, 1)
 	go func() {
 		<-ctx.Done()
-		shutdownErr <- server.Shutdown(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err := server.Shutdown(shutdownCtx)
+		if err != nil {
+			_ = server.Close()
+		}
+		shutdownErr <- err
 	}()
 
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
-	return <-shutdownErr
+	if err := <-shutdownErr; err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return nil
 }

@@ -11,10 +11,12 @@ import (
 
 // Event is an alert payload emitted when a service changes state.
 type Event struct {
-	HostName    string
-	ServiceName string
-	Status      int
-	Output      string
+	HostName       string
+	ServiceName    string
+	Status         int
+	PreviousStatus int
+	Recovered      bool
+	Output         string
 }
 
 // ---- Alert pipeline ----
@@ -35,14 +37,26 @@ func Start(ctx context.Context, results <-chan checker.Result) <-chan Event {
 				}
 				key := fmt.Sprintf("%s/%s", result.HostName, result.ServiceName)
 				previous, seen := last[key]
-				if !seen || previous != result.Status {
-					last[key] = result.Status
-					alerts <- Event{
-						HostName:    result.HostName,
-						ServiceName: result.ServiceName,
-						Status:      result.Status,
-						Output:      result.Output,
-					}
+				last[key] = result.Status
+				if !seen && result.Status == 0 {
+					// Skip initial OK states so we only notify on real problems.
+					continue
+				}
+				if seen && previous == result.Status {
+					continue
+				}
+				recovered := seen && previous != 0 && result.Status == 0
+				if result.Status == 0 && !recovered {
+					// Avoid sending OK transitions unless they are true recoveries.
+					continue
+				}
+				alerts <- Event{
+					HostName:       result.HostName,
+					ServiceName:    result.ServiceName,
+					Status:         result.Status,
+					PreviousStatus: previous,
+					Recovered:      recovered,
+					Output:         result.Output,
 				}
 			}
 		}

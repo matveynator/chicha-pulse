@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"chicha-pulse/pkg/activity"
 	"chicha-pulse/pkg/model"
 	"chicha-pulse/pkg/sshkeys"
 	"chicha-pulse/pkg/store"
@@ -171,21 +172,22 @@ func statusWordColor(word string) string {
 // ---- Public pipeline ----
 
 // Start launches the scheduler and worker pool with channels to avoid shared-state locks.
-func Start(ctx context.Context, st *store.Store) <-chan Result {
+func Start(ctx context.Context, st *store.Store) (<-chan Result, <-chan activity.Event) {
 	jobCh := make(chan Job)
 	resultCh := make(chan Result, runtime.NumCPU())
+	activityCh := make(chan activity.Event, runtime.NumCPU())
 	workerDone := make(chan struct{})
 
-	startScheduler(ctx, st, jobCh)
-	startWorkers(ctx, jobCh, resultCh, workerDone)
+	startScheduler(ctx, st, jobCh, activityCh)
+	startWorkers(ctx, jobCh, resultCh, activityCh, workerDone)
 	closeResults(ctx, workerDone, resultCh)
 
-	return resultCh
+	return resultCh, activityCh
 }
 
 // ---- Scheduler ----
 
-func startScheduler(ctx context.Context, st *store.Store, jobCh chan<- Job) {
+func startScheduler(ctx context.Context, st *store.Store, jobCh chan<- Job, activityCh chan<- activity.Event) {
 	go func() {
 		defer close(jobCh)
 		nextRun := make(map[string]time.Time)
@@ -198,20 +200,25 @@ func startScheduler(ctx context.Context, st *store.Store, jobCh chan<- Job) {
 			case <-ctx.Done():
 				return
 			case now := <-ticker.C:
-				publishJobs(ctx, st, jobCh, nextRun, pingCache, now)
+				publishJobs(ctx, st, jobCh, activityCh, nextRun, pingCache, now)
 			}
 		}
 	}()
 }
 
-func publishJobs(ctx context.Context, st *store.Store, jobCh chan<- Job, nextRun map[string]time.Time, pingCache map[string]pingResult, now time.Time) {
+func publishJobs(ctx context.Context, st *store.Store, jobCh chan<- Job, activityCh chan<- activity.Event, nextRun map[string]time.Time, pingCache map[string]pingResult, now time.Time) {
 	snapshot, err := st.Snapshot(ctx)
 	if err != nil {
 		return
 	}
+	parentStatus := buildParentStatus(snapshot, pingCache, now, ctx)
 	for _, host := range snapshot.Hosts {
 		sessionID := nextSessionID()
 		sequence := 0
+		if parentBlocked(parentStatus, host) {
+			logSessionWarn(sessionID, "stage=PLAN host=%s result=blocked reason=parent_unreachable", host.Name)
+			continue
+		}
 		ping := cachedPing(ctx, host, pingCache, now)
 		address := host.Address
 		if address == "" {
@@ -254,6 +261,12 @@ func publishJobs(ctx context.Context, st *store.Store, jobCh chan<- Job, nextRun
 				Sequence:      sequence,
 			}
 			nextRun[key] = now.Add(interval)
+			publishActivity(ctx, activityCh, activity.Event{
+				Kind:        activity.EventPlanned,
+				HostName:    job.HostName,
+				ServiceName: job.ServiceName,
+				ScheduledAt: now,
+			})
 			select {
 			case <-ctx.Done():
 				return
@@ -268,6 +281,53 @@ func intervalForService(minutes int) time.Duration {
 		return 5 * time.Minute
 	}
 	return time.Duration(minutes) * time.Minute
+}
+
+func buildParentStatus(snapshot model.Inventory, pingCache map[string]pingResult, now time.Time, ctx context.Context) map[string]bool {
+	// Resolve parent reachability once per tick so we can skip dependent checks.
+	status := make(map[string]bool, len(snapshot.Hosts))
+	for _, host := range snapshot.Hosts {
+		ping := cachedPing(ctx, host, pingCache, now)
+		status[host.Name] = ping.Reachable
+		if host.Address != "" {
+			status[host.Address] = ping.Reachable
+		}
+	}
+	return status
+}
+
+func parentBlocked(parentStatus map[string]bool, host *model.Host) bool {
+	parentNames := resolveParents(host)
+	if len(parentNames) == 0 {
+		return false
+	}
+	for _, parent := range parentNames {
+		if reachable, ok := parentStatus[parent]; ok && !reachable {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveParents(host *model.Host) []string {
+	// Prefer detected parents so runtime topology can override static config.
+	if strings.TrimSpace(host.DetectedParent) != "" {
+		return []string{host.DetectedParent}
+	}
+	if len(host.Parents) == 0 {
+		return nil
+	}
+	return append([]string(nil), host.Parents...)
+}
+
+func publishActivity(ctx context.Context, activityCh chan<- activity.Event, event activity.Event) {
+	// Keep activity streaming best-effort so checks never block.
+	select {
+	case <-ctx.Done():
+		return
+	case activityCh <- event:
+	default:
+	}
 }
 
 func describeServicePlan(services []model.Service, reachable bool) []string {
@@ -343,7 +403,7 @@ func pingHost(ctx context.Context, host *model.Host) pingResult {
 
 // ---- Workers ----
 
-func startWorkers(ctx context.Context, jobCh <-chan Job, resultCh chan<- Result, workerDone chan<- struct{}) {
+func startWorkers(ctx context.Context, jobCh <-chan Job, resultCh chan<- Result, activityCh chan<- activity.Event, workerDone chan<- struct{}) {
 	workers := runtime.NumCPU()
 	if workers < 1 {
 		workers = 1
@@ -353,7 +413,19 @@ func startWorkers(ctx context.Context, jobCh <-chan Job, resultCh chan<- Result,
 		go func() {
 			defer func() { workerDone <- struct{}{} }()
 			for job := range jobCh {
+				publishActivity(ctx, activityCh, activity.Event{
+					Kind:        activity.EventStarted,
+					HostName:    job.HostName,
+					ServiceName: job.ServiceName,
+					ScheduledAt: time.Now(),
+				})
 				result := runCheck(ctx, job)
+				publishActivity(ctx, activityCh, activity.Event{
+					Kind:        activity.EventFinished,
+					HostName:    job.HostName,
+					ServiceName: job.ServiceName,
+					ScheduledAt: time.Now(),
+				})
 				select {
 				case <-ctx.Done():
 					return

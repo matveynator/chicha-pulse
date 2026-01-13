@@ -1,0 +1,30 @@
+# This workflow publishes cross-compiled binaries when a "stable release" commit lands.
+name: stable-release
+
+on:
+  push:
+
+jobs:
+  release:
+    # Gate releases on the commit message to avoid accidental publications.
+    if: contains(join(github.event.commits.*.message, ' '), 'stable release')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build release binaries
+        run: scripts/build-release.sh
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

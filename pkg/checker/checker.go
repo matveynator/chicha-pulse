@@ -215,7 +215,7 @@ func closeResults(ctx context.Context, workerDone <-chan struct{}, resultCh chan
 // ---- Command execution ----
 
 func runCheck(ctx context.Context, job Job) Result {
-	command := strings.TrimSpace(job.CheckCommand)
+	command := expandCommand(strings.TrimSpace(job.CheckCommand), job)
 	result := Result{
 		HostName:     job.HostName,
 		ServiceName:  job.ServiceName,
@@ -281,6 +281,7 @@ func runSSHCheck(ctx context.Context, job Job, result Result) Result {
 	if remoteCommand == "" {
 		remoteCommand = "uptime"
 	}
+	remoteCommand = expandCommand(remoteCommand, job)
 	log.Printf("ssh check host=%s address=%s port=%d user=%s command=%q", job.HostName, address, port, job.SSHUser, remoteCommand)
 
 	if err := preflightTCP(ctx, address, port, "ssh"); err != nil {
@@ -332,6 +333,17 @@ func runSSHCheck(ctx context.Context, job Job, result Result) Result {
 	}
 	log.Printf("ssh exec ok host=%s address=%s port=%d output=%q", job.HostName, address, port, result.Output)
 	return result
+}
+
+func expandCommand(command string, job Job) string {
+	// Replace Nagios-style host macros so checks run with resolved targets.
+	address := job.HostAddress
+	if address == "" {
+		address = job.HostName
+	}
+	expanded := strings.ReplaceAll(command, "$HOSTADDRESS$", address)
+	expanded = strings.ReplaceAll(expanded, "$HOSTNAME$", job.HostName)
+	return expanded
 }
 
 func sshConfig(job Job) (*ssh.ClientConfig, error) {

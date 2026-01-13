@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -47,7 +48,7 @@ func Run(ctx context.Context) (Settings, error) {
 	reader := bufio.NewReader(os.Stdin)
 	printBanner()
 
-	stored, _ := loadSettings()
+	stored, _ := LoadSettings()
 	settings := stored
 	defaultNagios := fallbackValue(stored.ImportNagiosPath, "/etc/nagios4/nagios.cfg")
 
@@ -203,7 +204,16 @@ func loadSettings() (Settings, error) {
 
 // LoadSettings exposes stored settings so non-interactive runs can reuse the last setup.
 func LoadSettings() (Settings, error) {
-	return loadSettings()
+	fileSettings, err := loadSettings()
+	if err != nil {
+		return Settings{}, err
+	}
+	if fileSettings.DatabaseDriver != "" && fileSettings.DatabaseDSN != "" {
+		if stored, dbErr := loadSettingsFromDB(fileSettings.DatabaseDriver, fileSettings.DatabaseDSN); dbErr == nil {
+			return mergeSettings(fileSettings, stored), nil
+		}
+	}
+	return fileSettings, nil
 }
 
 func saveSettings(settings Settings) error {
@@ -220,6 +230,9 @@ func saveSettings(settings Settings) error {
 		"db_driver=" + settings.DatabaseDriver,
 		"db_dsn=" + settings.DatabaseDSN,
 	}, "\n")
+	if err := saveSettingsToDB(settings); err != nil {
+		fmt.Fprintf(os.Stderr, "setup db save failed: %v\n", err)
+	}
 	return os.WriteFile(path, []byte(content+"\n"), 0o600)
 }
 
@@ -238,6 +251,115 @@ func parseKeyValues(content string) map[string]string {
 		values[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
 	}
 	return values
+}
+
+func mergeSettings(base, override Settings) Settings {
+	merged := base
+	if strings.TrimSpace(override.ImportNagiosPath) != "" {
+		merged.ImportNagiosPath = override.ImportNagiosPath
+	}
+	if strings.TrimSpace(override.WebAddress) != "" {
+		merged.WebAddress = override.WebAddress
+	}
+	if strings.TrimSpace(override.WebAllowIP) != "" {
+		merged.WebAllowIP = override.WebAllowIP
+	}
+	if strings.TrimSpace(override.TelegramToken) != "" {
+		merged.TelegramToken = override.TelegramToken
+	}
+	if strings.TrimSpace(override.TelegramChatID) != "" {
+		merged.TelegramChatID = override.TelegramChatID
+	}
+	if strings.TrimSpace(override.DatabaseDriver) != "" {
+		merged.DatabaseDriver = override.DatabaseDriver
+	}
+	if strings.TrimSpace(override.DatabaseDSN) != "" {
+		merged.DatabaseDSN = override.DatabaseDSN
+	}
+	return merged
+}
+
+func loadSettingsFromDB(driverName, dsn string) (Settings, error) {
+	db, err := sql.Open(driverName, dsn)
+	if err != nil {
+		return Settings{}, err
+	}
+	defer db.Close()
+
+	statement := `SELECT import_nagios, web_addr, web_allow_ip, telegram_token, telegram_chat_id, db_driver, db_dsn
+FROM setup_settings ORDER BY updated_at DESC LIMIT 1`
+	row := db.QueryRow(statement)
+	settings := Settings{}
+	if err := row.Scan(
+		&settings.ImportNagiosPath,
+		&settings.WebAddress,
+		&settings.WebAllowIP,
+		&settings.TelegramToken,
+		&settings.TelegramChatID,
+		&settings.DatabaseDriver,
+		&settings.DatabaseDSN,
+	); err != nil {
+		return Settings{}, err
+	}
+	return settings, nil
+}
+
+func saveSettingsToDB(settings Settings) error {
+	if settings.DatabaseDriver == "" || settings.DatabaseDSN == "" {
+		return nil
+	}
+	db, err := sql.Open(settings.DatabaseDriver, settings.DatabaseDSN)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	schema := `CREATE TABLE IF NOT EXISTS setup_settings (
+id TEXT,
+import_nagios TEXT,
+web_addr TEXT,
+web_allow_ip TEXT,
+telegram_token TEXT,
+telegram_chat_id TEXT,
+db_driver TEXT,
+db_dsn TEXT,
+updated_at TEXT
+)`
+	if _, err := db.Exec(schema); err != nil {
+		return err
+	}
+	statement := fmt.Sprintf(`INSERT INTO setup_settings (
+id, import_nagios, web_addr, web_allow_ip, telegram_token, telegram_chat_id, db_driver, db_dsn, updated_at
+) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)`,
+		placeholder(settings.DatabaseDriver, 1),
+		placeholder(settings.DatabaseDriver, 2),
+		placeholder(settings.DatabaseDriver, 3),
+		placeholder(settings.DatabaseDriver, 4),
+		placeholder(settings.DatabaseDriver, 5),
+		placeholder(settings.DatabaseDriver, 6),
+		placeholder(settings.DatabaseDriver, 7),
+		placeholder(settings.DatabaseDriver, 8),
+		placeholder(settings.DatabaseDriver, 9),
+	)
+	_, err = db.Exec(statement,
+		fmt.Sprintf("%d", time.Now().UnixNano()),
+		settings.ImportNagiosPath,
+		settings.WebAddress,
+		settings.WebAllowIP,
+		settings.TelegramToken,
+		settings.TelegramChatID,
+		settings.DatabaseDriver,
+		settings.DatabaseDSN,
+		time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	return err
+}
+
+func placeholder(driverName string, index int) string {
+	if driverName == "postgres" {
+		return fmt.Sprintf("$%d", index)
+	}
+	return "?"
 }
 
 func sendTelegramTest(ctx context.Context, settings Settings) error {

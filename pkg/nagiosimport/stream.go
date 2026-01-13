@@ -23,6 +23,7 @@ type ObjectKind int
 const (
 	KindHost ObjectKind = iota
 	KindService
+	KindCommand
 )
 
 // Object carries parsed Nagios data to the rest of the pipeline.
@@ -31,6 +32,13 @@ type Object struct {
 	Host      model.Host
 	Service   model.Service
 	HostNames []string
+	Command   CommandDefinition
+}
+
+// CommandDefinition captures a Nagios command definition so services can be expanded.
+type CommandDefinition struct {
+	Name    string
+	Command string
 }
 
 // ---- Public API ----
@@ -199,6 +207,13 @@ func buildObject(objectType string, data map[string]string) (Object, bool) {
 			SSHCommand:           sshCommand,
 		}
 		return Object{Kind: KindService, Service: service, HostNames: hostNames}, true
+	case "command":
+		name := data["command_name"]
+		commandLine := data["command_line"]
+		if name == "" || commandLine == "" {
+			return Object{}, false
+		}
+		return Object{Kind: KindCommand, Command: CommandDefinition{Name: name, Command: commandLine}}, true
 	default:
 		return Object{}, false
 	}

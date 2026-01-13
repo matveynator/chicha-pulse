@@ -224,20 +224,24 @@ func runSSHCheck(ctx context.Context, job Job, result Result) Result {
 	if err != nil {
 		result.Status = 2
 		result.Output = err.Error()
+		log.Printf("ssh connect fail host=%s address=%s port=%d err=%q", job.HostName, address, port, result.Output)
 		return result
 	}
 	client, err := ssh.Dial("tcp", net.JoinHostPort(address, fmt.Sprintf("%d", port)), config)
 	if err != nil {
 		result.Status = 2
 		result.Output = err.Error()
+		log.Printf("ssh connect fail host=%s address=%s port=%d err=%q", job.HostName, address, port, result.Output)
 		return result
 	}
 	defer client.Close()
+	log.Printf("ssh connect ok host=%s address=%s port=%d", job.HostName, address, port)
 
 	session, err := client.NewSession()
 	if err != nil {
 		result.Status = 2
 		result.Output = err.Error()
+		log.Printf("ssh exec fail host=%s address=%s port=%d err=%q", job.HostName, address, port, result.Output)
 		return result
 	}
 	defer session.Close()
@@ -249,6 +253,7 @@ func runSSHCheck(ctx context.Context, job Job, result Result) Result {
 		if result.Output == "" {
 			result.Output = err.Error()
 		}
+		log.Printf("ssh exec fail host=%s address=%s port=%d output=%q", job.HostName, address, port, result.Output)
 		return result
 	}
 
@@ -256,6 +261,7 @@ func runSSHCheck(ctx context.Context, job Job, result Result) Result {
 	if result.Output == "" {
 		result.Output = "ok"
 	}
+	log.Printf("ssh exec ok host=%s address=%s port=%d output=%q", job.HostName, address, port, result.Output)
 	return result
 }
 

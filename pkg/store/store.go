@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	"chicha-pulse/pkg/model"
 	"chicha-pulse/pkg/nagiosimport"
@@ -154,6 +156,8 @@ func applyObject(inventory *model.Inventory, object nagiosimport.Object) {
 		applyHost(inventory, object.Host)
 	case nagiosimport.KindService:
 		applyService(inventory, object.Service, object.HostNames)
+	case nagiosimport.KindCommand:
+		applyCommand(inventory, object.Command)
 	}
 }
 
@@ -182,11 +186,39 @@ func applyService(inventory *model.Inventory, service model.Service, hostNames [
 			inventory.Hosts[hostName] = host
 		}
 		service.HostName = hostName
+		service.CheckCommand = expandCommand(inventory.Commands, service.CheckCommand)
 		if serviceExists(host.Services, service.Name) {
 			continue
 		}
 		host.Services = append(host.Services, service)
 	}
+}
+
+func applyCommand(inventory *model.Inventory, command nagiosimport.CommandDefinition) {
+	if command.Name == "" || command.Command == "" {
+		return
+	}
+	inventory.Commands[command.Name] = command.Command
+}
+
+func expandCommand(commands map[string]string, raw string) string {
+	if raw == "" {
+		return raw
+	}
+	parts := strings.Split(raw, "!")
+	if len(parts) == 0 {
+		return raw
+	}
+	commandLine, ok := commands[parts[0]]
+	if !ok {
+		return raw
+	}
+	expanded := commandLine
+	for index, arg := range parts[1:] {
+		placeholder := fmt.Sprintf("$ARG%d$", index+1)
+		expanded = strings.ReplaceAll(expanded, placeholder, arg)
+	}
+	return expanded
 }
 
 func serviceExists(services []model.Service, name string) bool {

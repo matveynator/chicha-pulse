@@ -42,6 +42,7 @@ type Inventory struct {
 	Hosts    map[string]*Host
 	Groups   map[string]struct{}
 	Statuses map[string]ServiceStatus
+	Commands map[string]string
 }
 
 // ---- Constructors ----
@@ -52,6 +53,7 @@ func NewInventory() Inventory {
 		Hosts:    make(map[string]*Host),
 		Groups:   make(map[string]struct{}),
 		Statuses: make(map[string]ServiceStatus),
+		Commands: make(map[string]string),
 	}
 }
 
@@ -78,6 +80,9 @@ func (inv Inventory) Clone() Inventory {
 	}
 	for key, status := range inv.Statuses {
 		clone.Statuses[key] = status
+	}
+	for name, command := range inv.Commands {
+		clone.Commands[name] = command
 	}
 	return clone
 }

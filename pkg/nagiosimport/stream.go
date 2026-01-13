@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -184,12 +185,16 @@ func buildObject(objectType string, data map[string]string) (Object, bool) {
 		if serviceName == "" || len(hostNames) == 0 {
 			return Object{}, false
 		}
+		sshUser, sshKey := parseSSHCommand(data["check_command"])
 		service := model.Service{
 			Name:                 serviceName,
 			CheckCommand:         data["check_command"],
 			Notes:                data["notes"],
 			NotificationsEnabled: data["notifications_enabled"] != "0",
 			Contacts:             splitList(data["contacts"]),
+			CheckIntervalMinutes: parseIntervalMinutes(data["check_interval"]),
+			SSHUser:              sshUser,
+			SSHKeyPath:           sshKey,
 		}
 		return Object{Kind: KindService, Service: service, HostNames: hostNames}, true
 	default:
@@ -212,4 +217,53 @@ func splitList(value string) []string {
 		}
 	}
 	return result
+}
+
+func parseIntervalMinutes(value string) int {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return 5
+	}
+	interval, err := strconv.Atoi(trimmed)
+	if err != nil || interval <= 0 {
+		return 5
+	}
+	return interval
+}
+
+func parseSSHCommand(command string) (string, string) {
+	if command == "" {
+		return "", ""
+	}
+	if strings.Contains(command, "check_by_ssh") {
+		parts := strings.Split(command, "!")
+		if len(parts) > 1 {
+			return strings.TrimSpace(parts[1]), findKeyPath(parts)
+		}
+	}
+	fields := strings.Fields(command)
+	user := ""
+	key := ""
+	for i := 0; i < len(fields); i++ {
+		switch fields[i] {
+		case "-l":
+			if i+1 < len(fields) {
+				user = fields[i+1]
+			}
+		case "-i":
+			if i+1 < len(fields) {
+				key = fields[i+1]
+			}
+		}
+	}
+	return user, key
+}
+
+func findKeyPath(parts []string) string {
+	for _, part := range parts {
+		if strings.Contains(part, "/") {
+			return strings.TrimSpace(part)
+		}
+	}
+	return ""
 }

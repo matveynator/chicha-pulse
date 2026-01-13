@@ -17,6 +17,7 @@ type Job struct {
 	HostName     string
 	ServiceName  string
 	CheckCommand string
+	Interval     time.Duration
 }
 
 // Result captures the output and status so downstream stages can notify and store data.
@@ -32,12 +33,12 @@ type Result struct {
 // ---- Public pipeline ----
 
 // Start launches the scheduler and worker pool with channels to avoid shared-state locks.
-func Start(ctx context.Context, st *store.Store, interval time.Duration) <-chan Result {
+func Start(ctx context.Context, st *store.Store) <-chan Result {
 	jobCh := make(chan Job)
 	resultCh := make(chan Result, runtime.NumCPU())
 	workerDone := make(chan struct{})
 
-	startScheduler(ctx, st, interval, jobCh)
+	startScheduler(ctx, st, jobCh)
 	startWorkers(ctx, jobCh, resultCh, workerDone)
 	closeResults(ctx, workerDone, resultCh)
 
@@ -46,36 +47,43 @@ func Start(ctx context.Context, st *store.Store, interval time.Duration) <-chan 
 
 // ---- Scheduler ----
 
-func startScheduler(ctx context.Context, st *store.Store, interval time.Duration, jobCh chan<- Job) {
+func startScheduler(ctx context.Context, st *store.Store, jobCh chan<- Job) {
 	go func() {
 		defer close(jobCh)
-		publishJobs(ctx, st, jobCh)
-		ticker := time.NewTicker(interval)
+		nextRun := make(map[string]time.Time)
+		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				publishJobs(ctx, st, jobCh)
+			case now := <-ticker.C:
+				publishJobs(ctx, st, jobCh, nextRun, now)
 			}
 		}
 	}()
 }
 
-func publishJobs(ctx context.Context, st *store.Store, jobCh chan<- Job) {
+func publishJobs(ctx context.Context, st *store.Store, jobCh chan<- Job, nextRun map[string]time.Time, now time.Time) {
 	snapshot, err := st.Snapshot(ctx)
 	if err != nil {
 		return
 	}
 	for _, host := range snapshot.Hosts {
 		for _, service := range host.Services {
+			key := host.Name + "/" + service.Name
+			interval := intervalForService(service.CheckIntervalMinutes)
+			if dueAt, ok := nextRun[key]; ok && now.Before(dueAt) {
+				continue
+			}
 			job := Job{
 				HostName:     host.Name,
 				ServiceName:  service.Name,
 				CheckCommand: service.CheckCommand,
+				Interval:     interval,
 			}
+			nextRun[key] = now.Add(interval)
 			select {
 			case <-ctx.Done():
 				return
@@ -83,6 +91,13 @@ func publishJobs(ctx context.Context, st *store.Store, jobCh chan<- Job) {
 			}
 		}
 	}
+}
+
+func intervalForService(minutes int) time.Duration {
+	if minutes <= 0 {
+		return 5 * time.Minute
+	}
+	return time.Duration(minutes) * time.Minute
 }
 
 // ---- Workers ----

@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"chicha-pulse/pkg/model"
@@ -63,6 +65,13 @@ func Run(ctx context.Context) (Settings, error) {
 	settings.WebAddress = prompt(reader, "Web port [4321]: ", "4321")
 	settings.WebAddress = normalizeAddress(settings.WebAddress)
 
+	allowIP := prompt(reader, "Lock web port to a single IP with iptables? (leave empty to skip): ", "")
+	if allowIP != "" {
+		if err := applyIptables(ctx, settings.WebAddress, allowIP); err != nil {
+			return Settings{}, err
+		}
+	}
+
 	settings.DatabaseDriver = prompt(reader, "Database driver [sqlite]: ", "sqlite")
 	settings.DatabaseDriver = strings.ToLower(strings.TrimSpace(settings.DatabaseDriver))
 	if settings.DatabaseDriver == "" {
@@ -103,6 +112,33 @@ func defaultSQLitePath(address string) string {
 	path := filepath.Join("/var/lib/chicha-pulse", fmt.Sprintf("database-%s.sqlite", port))
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
 	return "file:" + path
+}
+
+func applyIptables(ctx context.Context, address, ip string) error {
+	port, err := portFromAddress(address)
+	if err != nil {
+		return err
+	}
+	allow := exec.CommandContext(ctx, "iptables", "-A", "INPUT", "-p", "tcp", "--dport", port, "-s", ip, "-j", "ACCEPT")
+	if output, err := allow.CombinedOutput(); err != nil {
+		return fmt.Errorf("iptables allow failed: %s", strings.TrimSpace(string(output)))
+	}
+	deny := exec.CommandContext(ctx, "iptables", "-A", "INPUT", "-p", "tcp", "--dport", port, "-j", "DROP")
+	if output, err := deny.CombinedOutput(); err != nil {
+		return fmt.Errorf("iptables deny failed: %s", strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func portFromAddress(address string) (string, error) {
+	trimmed := strings.TrimPrefix(address, ":")
+	if trimmed == "" {
+		return "", fmt.Errorf("invalid address: %s", address)
+	}
+	if _, err := strconv.Atoi(trimmed); err != nil {
+		return "", fmt.Errorf("invalid port: %s", trimmed)
+	}
+	return trimmed, nil
 }
 
 func printBanner() {

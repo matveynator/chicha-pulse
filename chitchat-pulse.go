@@ -14,6 +14,7 @@ import (
 
 	"chicha-pulse/pkg/alert"
 	"chicha-pulse/pkg/checker"
+	"chicha-pulse/pkg/model"
 	"chicha-pulse/pkg/nagiosimport"
 	"chicha-pulse/pkg/notify"
 	"chicha-pulse/pkg/setup"
@@ -33,7 +34,6 @@ type Configuration struct {
 	ImportNagiosPath string
 	WebAddress       string
 	PageTitle        string
-	CheckInterval    time.Duration
 	TelegramToken    string
 	TelegramChatID   string
 	DatabaseDriver   string
@@ -74,9 +74,10 @@ func main() {
 	}
 	defer closeDatabase(database)
 
-	results := checker.Start(ctx, st, config.CheckInterval)
-	alertInput, storageInput := fanOutResults(ctx, results)
+	results := checker.Start(ctx, st)
+	alertInput, storageInput, statusInput := fanOutResults(ctx, results)
 	alertEvents := alert.Start(ctx, alertInput)
+	startStatusSink(ctx, st, statusInput)
 
 	if config.TelegramToken != "" && config.TelegramChatID != "" {
 		notifier := notify.NewTelegram(config.TelegramToken, config.TelegramChatID)
@@ -122,7 +123,6 @@ func parseFlags() Configuration {
 	flag.StringVar(&config.ImportNagiosPath, "import-nagios", "", "Path to Nagios config directory or nagios.cfg")
 	flag.StringVar(&config.WebAddress, "web-addr", ":8080", "HTTP listen address")
 	flag.StringVar(&config.PageTitle, "page-title", "chicha-pulse", "Dashboard title")
-	flag.DurationVar(&config.CheckInterval, "check-interval", 30*time.Second, "Interval between check runs")
 	flag.StringVar(&config.TelegramToken, "telegram-token", "", "Telegram bot token")
 	flag.StringVar(&config.TelegramChatID, "telegram-chat-id", "", "Telegram chat ID for notifications")
 	flag.StringVar(&config.DatabaseDriver, "db-driver", "sqlite", "Database driver (sqlite or postgres)")
@@ -145,7 +145,6 @@ func printHelp() {
 	fmt.Fprintln(os.Stderr, "  -setup                 Run interactive setup wizard")
 	fmt.Fprintln(os.Stderr, "  -web-addr              HTTP listen address (default :8080)")
 	fmt.Fprintln(os.Stderr, "  -page-title            Dashboard title")
-	fmt.Fprintln(os.Stderr, "  -check-interval         Interval between check runs")
 	fmt.Fprintln(os.Stderr, "")
 
 	fmt.Fprintf(os.Stderr, "%s2) Database flags%s\n", cyan, reset)
@@ -155,6 +154,8 @@ func printHelp() {
 
 	fmt.Fprintf(os.Stderr, "%s3) Import flags%s\n", cyan, reset)
 	fmt.Fprintln(os.Stderr, "  -import-nagios          Path to Nagios config directory or nagios.cfg")
+	fmt.Fprintln(os.Stderr, "  -telegram-token         Telegram bot token")
+	fmt.Fprintln(os.Stderr, "  -telegram-chat-id       Telegram chat ID for notifications")
 	fmt.Fprintln(os.Stderr, "")
 
 	fmt.Fprintf(os.Stderr, "%s4) Export flags%s\n", cyan, reset)
@@ -210,12 +211,14 @@ func runImport(ctx context.Context, st *store.Store, root string) error {
 
 // ---- Result routing ----
 
-func fanOutResults(ctx context.Context, input <-chan checker.Result) (<-chan checker.Result, <-chan checker.Result) {
+func fanOutResults(ctx context.Context, input <-chan checker.Result) (<-chan checker.Result, <-chan checker.Result, <-chan checker.Result) {
 	alerts := make(chan checker.Result, 8)
 	storageStream := make(chan checker.Result, 8)
+	statusStream := make(chan checker.Result, 8)
 	go func() {
 		defer close(alerts)
 		defer close(storageStream)
+		defer close(statusStream)
 		for {
 			select {
 			case <-ctx.Done():
@@ -234,10 +237,44 @@ func fanOutResults(ctx context.Context, input <-chan checker.Result) (<-chan che
 					return
 				case storageStream <- result:
 				}
+				select {
+				case <-ctx.Done():
+					return
+				case statusStream <- result:
+				}
 			}
 		}
 	}()
-	return alerts, storageStream
+	return alerts, storageStream, statusStream
+}
+
+func startStatusSink(ctx context.Context, st *store.Store, input <-chan checker.Result) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case result, ok := <-input:
+				if !ok {
+					return
+				}
+				status := modelStatus(result)
+				_ = st.UpdateStatus(ctx, statusKey(result), status)
+			}
+		}
+	}()
+}
+
+func modelStatus(result checker.Result) model.ServiceStatus {
+	return model.ServiceStatus{
+		Status:    result.Status,
+		Output:    result.Output,
+		CheckedAt: result.CheckedAt,
+	}
+}
+
+func statusKey(result checker.Result) string {
+	return result.HostName + "/" + result.ServiceName
 }
 
 // ---- Web auth ----

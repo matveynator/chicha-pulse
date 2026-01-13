@@ -19,19 +19,39 @@ type updateRequest struct {
 	object nagiosimport.Object
 }
 
+type statusRequest struct {
+	key    string
+	status model.ServiceStatus
+}
+
+type groupRequest struct {
+	name string
+}
+
+type assignRequest struct {
+	hostName string
+	group    string
+}
+
 // ---- Store ----
 
 // Store keeps the inventory inside one goroutine so callers never race over shared state.
 type Store struct {
-	requests chan snapshotRequest
-	updates  chan updateRequest
+	requests      chan snapshotRequest
+	updates       chan updateRequest
+	statusUpdates chan statusRequest
+	groupAdds     chan groupRequest
+	groupAssigns  chan assignRequest
 }
 
 // New creates the store and starts the loop that owns the inventory.
 func New(ctx context.Context) *Store {
 	st := &Store{
-		requests: make(chan snapshotRequest),
-		updates:  make(chan updateRequest),
+		requests:      make(chan snapshotRequest),
+		updates:       make(chan updateRequest),
+		statusUpdates: make(chan statusRequest),
+		groupAdds:     make(chan groupRequest),
+		groupAssigns:  make(chan assignRequest),
 	}
 	go st.run(ctx)
 	return st
@@ -63,6 +83,36 @@ func (st *Store) Snapshot(ctx context.Context) (model.Inventory, error) {
 	}
 }
 
+// UpdateStatus records the latest check result for a service without exposing shared state.
+func (st *Store) UpdateStatus(ctx context.Context, key string, status model.ServiceStatus) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case st.statusUpdates <- statusRequest{key: key, status: status}:
+		return nil
+	}
+}
+
+// AddGroup creates a new group name that can be assigned to hosts.
+func (st *Store) AddGroup(ctx context.Context, name string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case st.groupAdds <- groupRequest{name: name}:
+		return nil
+	}
+}
+
+// AssignHostGroup links a host to a group name for UI filtering.
+func (st *Store) AssignHostGroup(ctx context.Context, hostName, group string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case st.groupAssigns <- assignRequest{hostName: hostName, group: group}:
+		return nil
+	}
+}
+
 // ---- Internal loop ----
 
 func (st *Store) run(ctx context.Context) {
@@ -74,6 +124,22 @@ func (st *Store) run(ctx context.Context) {
 			return
 		case update := <-st.updates:
 			applyObject(&inventory, update.object)
+		case status := <-st.statusUpdates:
+			inventory.Statuses[status.key] = status.status
+		case group := <-st.groupAdds:
+			if group.name != "" {
+				inventory.Groups[group.name] = struct{}{}
+			}
+		case assignment := <-st.groupAssigns:
+			host, ok := inventory.Hosts[assignment.hostName]
+			if !ok {
+				host = &model.Host{Name: assignment.hostName}
+				inventory.Hosts[assignment.hostName] = host
+			}
+			if assignment.group != "" {
+				inventory.Groups[assignment.group] = struct{}{}
+				host.Group = assignment.group
+			}
 		case request := <-st.requests:
 			request.response <- inventory.Clone()
 		}
@@ -99,6 +165,7 @@ func applyHost(inventory *model.Inventory, host model.Host) {
 			Name:    host.Name,
 			Address: host.Address,
 			Parents: append([]string(nil), host.Parents...),
+			Group:   host.Group,
 		}
 		return
 	}

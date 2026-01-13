@@ -41,8 +41,9 @@ func Run(ctx context.Context) (Settings, error) {
 	reader := bufio.NewReader(os.Stdin)
 	printBanner()
 
-	settings := Settings{}
-	defaultNagios := "/etc/nagios4/nagios.cfg"
+	stored, _ := loadSettings()
+	settings := stored
+	defaultNagios := fallbackValue(stored.ImportNagiosPath, "/etc/nagios4/nagios.cfg")
 
 	path := prompt(reader, fmt.Sprintf("Nagios config path [%s]: ", defaultNagios), defaultNagios)
 	summary, err := summarizeNagios(ctx, path)
@@ -57,12 +58,13 @@ func Run(ctx context.Context) (Settings, error) {
 	}
 
 	settings.ImportNagiosPath = path
-	settings.TelegramToken = prompt(reader, "Telegram bot token (leave empty to skip): ", "")
+	settings.TelegramToken = prompt(reader, "Telegram bot token (leave empty to skip): ", stored.TelegramToken)
 	if settings.TelegramToken != "" {
-		settings.TelegramChatID = prompt(reader, "Telegram chat ID: ", "")
+		settings.TelegramChatID = prompt(reader, "Telegram chat ID: ", stored.TelegramChatID)
 	}
 
-	settings.WebAddress = prompt(reader, "Web port [4321]: ", "4321")
+	defaultPort := fallbackValue(strings.TrimPrefix(stored.WebAddress, ":"), "4321")
+	settings.WebAddress = prompt(reader, fmt.Sprintf("Web port [%s]: ", defaultPort), defaultPort)
 	settings.WebAddress = normalizeAddress(settings.WebAddress)
 
 	allowIP := prompt(reader, "Lock web port to a single IP with iptables? (leave empty to skip): ", "")
@@ -72,16 +74,20 @@ func Run(ctx context.Context) (Settings, error) {
 		}
 	}
 
-	settings.DatabaseDriver = prompt(reader, "Database driver [sqlite]: ", "sqlite")
+	settings.DatabaseDriver = prompt(reader, "Database driver [sqlite]: ", fallbackValue(stored.DatabaseDriver, "sqlite"))
 	settings.DatabaseDriver = strings.ToLower(strings.TrimSpace(settings.DatabaseDriver))
 	if settings.DatabaseDriver == "" {
 		settings.DatabaseDriver = "sqlite"
 	}
 	if settings.DatabaseDriver == "postgres" {
-		settings.DatabaseDSN = prompt(reader, "Postgres DSN: ", "")
+		settings.DatabaseDSN = prompt(reader, "Postgres DSN: ", stored.DatabaseDSN)
 	} else {
 		settings.DatabaseDSN = defaultSQLitePath(settings.WebAddress)
 		fmt.Printf("SQLite database path: %s\n", settings.DatabaseDSN)
+	}
+
+	if err := saveSettings(settings); err != nil {
+		return Settings{}, err
 	}
 
 	return settings, nil
@@ -97,6 +103,13 @@ func prompt(reader *bufio.Reader, label, fallback string) string {
 		return fallback
 	}
 	return text
+}
+
+func fallbackValue(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
 
 func normalizeAddress(port string) string {
@@ -148,6 +161,61 @@ func printBanner() {
 	fmt.Println(purple + "══════════════════════════════════════" + reset)
 	fmt.Println(cyan + "   chicha-pulse interactive setup" + reset)
 	fmt.Println(purple + "══════════════════════════════════════" + reset)
+}
+
+// ---- Settings persistence ----
+
+func settingsPath() string {
+	return "/var/lib/chicha-pulse/settings.conf"
+}
+
+func loadSettings() (Settings, error) {
+	data, err := os.ReadFile(settingsPath())
+	if err != nil {
+		return Settings{}, err
+	}
+	parsed := parseKeyValues(string(data))
+	return Settings{
+		ImportNagiosPath: parsed["import_nagios"],
+		WebAddress:       parsed["web_addr"],
+		TelegramToken:    parsed["telegram_token"],
+		TelegramChatID:   parsed["telegram_chat_id"],
+		DatabaseDriver:   parsed["db_driver"],
+		DatabaseDSN:      parsed["db_dsn"],
+	}, nil
+}
+
+func saveSettings(settings Settings) error {
+	path := settingsPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	content := strings.Join([]string{
+		"import_nagios=" + settings.ImportNagiosPath,
+		"web_addr=" + settings.WebAddress,
+		"telegram_token=" + settings.TelegramToken,
+		"telegram_chat_id=" + settings.TelegramChatID,
+		"db_driver=" + settings.DatabaseDriver,
+		"db_dsn=" + settings.DatabaseDSN,
+	}, "\n")
+	return os.WriteFile(path, []byte(content+"\n"), 0o600)
+}
+
+func parseKeyValues(content string) map[string]string {
+	values := make(map[string]string)
+	lines := strings.Split(content, "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		parts := strings.SplitN(trimmed, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		values[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+	}
+	return values
 }
 
 // ---- Nagios summary ----

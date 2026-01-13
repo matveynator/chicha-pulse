@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -21,6 +20,7 @@ import (
 	"chicha-pulse/pkg/model"
 	"chicha-pulse/pkg/nagiosimport"
 	"chicha-pulse/pkg/sshkeys"
+	"chicha-pulse/pkg/tlsmanager"
 )
 
 // Package setup provides an interactive wizard so the first run is self-guided.
@@ -214,7 +214,7 @@ func Run(ctx context.Context) (Settings, error) {
 		fmt.Printf("SQLite database path: %s\n", settings.DatabaseDSN)
 	}
 
-	printSectionTitle("TLS", "Optional HTTPS with automatic Let's Encrypt certificates.")
+	printSectionTitle("TLS", "Optional HTTPS with automatic TLS certificates managed by the app.")
 	if strings.TrimSpace(settings.DomainName) == "" {
 		response, err := prompt(ctx, reader, "Domain for HTTPS certificates (leave empty to skip): ", "")
 		if err != nil {
@@ -223,7 +223,7 @@ func Run(ctx context.Context) (Settings, error) {
 		settings.DomainName = strings.TrimSpace(response)
 	}
 	if settings.DomainName != "" && strings.TrimSpace(settings.SSLEmail) == "" {
-		response, err := prompt(ctx, reader, "Email for Let's Encrypt alerts: ", settings.SSLEmail)
+		response, err := prompt(ctx, reader, "Email for TLS certificate alerts: ", settings.SSLEmail)
 		if err != nil {
 			return Settings{}, err
 		}
@@ -1113,43 +1113,20 @@ func sendTelegramTest(ctx context.Context, settings Settings) error {
 }
 
 func ensureLetsEncrypt(ctx context.Context, domain string, email string) error {
-	// Use certbot so HTTPS certificates are issued and auto-renewed by the system.
+	// Generate certificates with Go so setup does not depend on external tooling.
 	if strings.TrimSpace(domain) == "" {
 		return nil
 	}
 	if strings.TrimSpace(email) == "" {
-		return fmt.Errorf("ssl email is required for Let's Encrypt")
+		return fmt.Errorf("ssl email is required for TLS certificates")
 	}
-	if _, err := exec.LookPath("certbot"); err != nil {
-		return fmt.Errorf("certbot not found in PATH; install certbot or remove the TLS domain to proceed")
-	}
-	args := []string{
-		"certonly",
-		"--standalone",
-		"--non-interactive",
-		"--agree-tos",
-		"-m", email,
-		"-d", domain,
-	}
-	cmd := exec.CommandContext(ctx, "certbot", args...)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		message := strings.TrimSpace(string(output))
-		if message == "" {
-			message = err.Error()
-		}
-		return fmt.Errorf("certbot failed: %s", message)
-	}
-	if err := ensureRenewCron(); err != nil {
+	if _, err := tlsmanager.Ensure(ctx, tlsmanager.Config{
+		Domain: domain,
+		Email:  email,
+	}); err != nil {
 		return err
 	}
 	return nil
-}
-
-func ensureRenewCron() error {
-	// Write a cron job so certbot renew runs automatically.
-	cronPath := "/etc/cron.d/chicha-pulse-renew"
-	content := "0 3 * * * root certbot renew --quiet\n"
-	return os.WriteFile(cronPath, []byte(content), 0o644)
 }
 
 func telegramEndpoint(token string) string {

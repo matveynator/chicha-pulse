@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"chicha-pulse/pkg/setup"
 	"chicha-pulse/pkg/storage"
 	"chicha-pulse/pkg/store"
+	"chicha-pulse/pkg/tlsmanager"
 	"chicha-pulse/pkg/web"
 
 	_ "chicha-pulse/pkg/localsql"
@@ -333,8 +335,16 @@ func closeDatabase(database *storage.Store) {
 
 func runTLS(ctx context.Context, server *http.Server, domain string) error {
 	// Serve HTTPS with a redirect server on port 80 for convenience.
-	certFile := fmt.Sprintf("/etc/letsencrypt/live/%s/fullchain.pem", domain)
-	keyFile := fmt.Sprintf("/etc/letsencrypt/live/%s/privkey.pem", domain)
+	// We generate or refresh certificates here so runtime TLS always has material to load.
+	paths, err := tlsmanager.Ensure(ctx, tlsmanager.Config{Domain: domain})
+	if err != nil {
+		return err
+	}
+	// The broker keeps TLS reloading serialized without mutexes.
+	broker := tlsmanager.NewBroker(ctx, paths, time.Minute)
+	server.TLSConfig = &tls.Config{
+		GetCertificate: broker.GetCertificate,
+	}
 	redirectServer := &http.Server{
 		Addr: ":80",
 		Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -347,17 +357,17 @@ func runTLS(ctx context.Context, server *http.Server, domain string) error {
 			log.Printf("redirect server stopped: %v", err)
 		}
 	}()
-	return runTLSWithContext(ctx, server, certFile, keyFile)
+	return runTLSWithContext(ctx, server)
 }
 
-func runTLSWithContext(ctx context.Context, server *http.Server, certFile string, keyFile string) error {
+func runTLSWithContext(ctx context.Context, server *http.Server) error {
 	// Respect context cancellation while serving TLS.
 	shutdownErr := make(chan error, 1)
 	go func() {
 		<-ctx.Done()
 		shutdownErr <- server.Shutdown(context.Background())
 	}()
-	if err := server.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
+	if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	return <-shutdownErr

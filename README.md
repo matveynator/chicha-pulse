@@ -71,6 +71,45 @@ One binary. One pulse.
 
 ---
 
+## First monitoring feature
+
+chicha-pulse can import Nagios configuration files with `-import-nagios`, run the
+checks on schedule using per-service intervals, and notify a Telegram channel when
+service state changes. A web panel lists head machines, their virtual machines, all
+services attached per host, and groups. Web credentials are generated on startup
+and printed to the log.
+
+### Interactive setup
+
+Run `-setup` to walk through configuration interactively with a colorized menu.
+The wizard finds Nagios configs, summarizes them, asks before import, and can
+optionally apply an iptables rule to lock the web port to a single IP.
+
+### Supported Nagios objects
+
+- `host` with `host_name`, `address`, and optional `parents`.
+- `service` with `service_description`, `host_name`, `check_command`, and
+  optional `contacts`, `notifications_enabled`, and `check_interval`.
+
+Hosts without parents are shown as head machines. Hosts that declare a parent are
+shown as virtual machines under that head. Services are attached to each host
+referenced in the Nagios file.
+
+### Example
+
+```bash
+go run . -setup
+```
+
+### Database
+
+chicha-pulse uses `database/sql` and expects either a `sqlite` or `postgres`
+driver to be registered. The project ships an internal driver placeholder that
+stores data in memory so the pipeline runs even without external dependencies.
+Provide a real driver implementation later if you need persistence.
+
+---
+
 ## Status
 
 Early stage. Focused on correctness and simplicity.

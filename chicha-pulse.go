@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -50,6 +51,10 @@ func main() {
 	if config.SetupMode {
 		settings, err := setup.Run(ctx)
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				log.Printf("setup cancelled")
+				return
+			}
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

@@ -54,20 +54,35 @@ func Run(ctx context.Context) (Settings, error) {
 	stored, _ := LoadSettings()
 	settings := stored
 
-	settings.DatabaseDriver = prompt(reader, "Database driver [sqlite]: ", fallbackValue(stored.DatabaseDriver, "sqlite"))
-	settings.DatabaseDriver = strings.ToLower(strings.TrimSpace(settings.DatabaseDriver))
-	if settings.DatabaseDriver == "" {
-		settings.DatabaseDriver = "sqlite"
+	if strings.TrimSpace(settings.DatabaseDriver) == "" {
+		response, err := prompt(ctx, reader, "Database driver [sqlite]: ", fallbackValue(stored.DatabaseDriver, "sqlite"))
+		if err != nil {
+			return Settings{}, err
+		}
+		settings.DatabaseDriver = strings.ToLower(strings.TrimSpace(response))
+		if settings.DatabaseDriver == "" {
+			settings.DatabaseDriver = "sqlite"
+		}
 	}
 	defaultPort := fallbackValue(strings.TrimPrefix(stored.WebAddress, ":"), "4321")
-	if settings.DatabaseDriver == "postgres" {
-		settings.DatabaseDSN = prompt(reader, fmt.Sprintf("Postgres DSN [%s]: ", stored.DatabaseDSN), stored.DatabaseDSN)
-	} else {
-		fallbackDSN := stored.DatabaseDSN
-		if fallbackDSN == "" {
-			fallbackDSN = defaultSQLitePath(":" + defaultPort)
+	if strings.TrimSpace(settings.DatabaseDSN) == "" {
+		if settings.DatabaseDriver == "postgres" {
+			response, err := prompt(ctx, reader, fmt.Sprintf("Postgres DSN [%s]: ", stored.DatabaseDSN), stored.DatabaseDSN)
+			if err != nil {
+				return Settings{}, err
+			}
+			settings.DatabaseDSN = response
+		} else {
+			fallbackDSN := stored.DatabaseDSN
+			if fallbackDSN == "" {
+				fallbackDSN = defaultSQLitePath(":" + defaultPort)
+			}
+			response, err := prompt(ctx, reader, fmt.Sprintf("SQLite database path [%s]: ", fallbackDSN), fallbackDSN)
+			if err != nil {
+				return Settings{}, err
+			}
+			settings.DatabaseDSN = response
 		}
-		settings.DatabaseDSN = prompt(reader, fmt.Sprintf("SQLite database path [%s]: ", fallbackDSN), fallbackDSN)
 	}
 	if strings.TrimSpace(settings.DatabaseDSN) != "" {
 		if storedFromDB, err := loadSettingsFromDB(settings.DatabaseDriver, settings.DatabaseDSN); err == nil {
@@ -82,7 +97,14 @@ func Run(ctx context.Context) (Settings, error) {
 	printExistingSettings(settings)
 
 	defaultNagios := fallbackValue(settings.ImportNagiosPath, "/etc/nagios4/nagios.cfg")
-	path := prompt(reader, fmt.Sprintf("Nagios config path [%s]: ", defaultNagios), defaultNagios)
+	path := defaultNagios
+	if strings.TrimSpace(settings.ImportNagiosPath) == "" {
+		response, err := prompt(ctx, reader, fmt.Sprintf("Nagios config path [%s]: ", defaultNagios), defaultNagios)
+		if err != nil {
+			return Settings{}, err
+		}
+		path = response
+	}
 	summary, err := summarizeNagios(ctx, path)
 	if err != nil {
 		return Settings{}, err
@@ -106,16 +128,25 @@ func Run(ctx context.Context) (Settings, error) {
 	confirm := "Y"
 	if hasPrevious && delta.HasNoNew {
 		fmt.Println("All services already imported.")
-		confirm = prompt(reader, "No new inventory since last import. Skip import? [Y/n]: ", "Y")
+		confirm, err = prompt(ctx, reader, "No new inventory since last import. Skip import? [Y/n]: ", "Y")
+		if err != nil {
+			return Settings{}, err
+		}
 		if strings.ToLower(confirm) == "n" {
 			confirm = "Y"
 		} else {
 			confirm = "SKIP"
 		}
 	} else if hasPrevious {
-		confirm = prompt(reader, fmt.Sprintf("Import new inventory? (+%d hosts, +%d services, +%d notifications) [Y/n]: ", delta.AddedHosts, delta.AddedServices, delta.AddedNotifications), "Y")
+		confirm, err = prompt(ctx, reader, fmt.Sprintf("Import new inventory? (+%d hosts, +%d services, +%d notifications) [Y/n]: ", delta.AddedHosts, delta.AddedServices, delta.AddedNotifications), "Y")
+		if err != nil {
+			return Settings{}, err
+		}
 	} else {
-		confirm = prompt(reader, "Import this configuration? [Y/n]: ", "Y")
+		confirm, err = prompt(ctx, reader, "Import this configuration? [Y/n]: ", "Y")
+		if err != nil {
+			return Settings{}, err
+		}
 	}
 	if strings.ToLower(confirm) == "n" {
 		confirm = "SKIP"
@@ -130,21 +161,41 @@ func Run(ctx context.Context) (Settings, error) {
 	}
 
 	settings.ImportNagiosPath = path
-	settings.TelegramToken = prompt(reader, "Telegram bot token (leave empty to skip): ", settings.TelegramToken)
-	if settings.TelegramToken != "" {
-		settings.TelegramChatID = prompt(reader, "Telegram chat ID: ", settings.TelegramChatID)
-	}
-
-	settings.WebAddress = prompt(reader, fmt.Sprintf("Web port [%s]: ", defaultPort), defaultPort)
-	settings.WebAddress = normalizeAddress(settings.WebAddress)
-
-	allowIP := prompt(reader, "Lock web port to a single IP with iptables? (leave empty to skip): ", settings.WebAllowIP)
-	if allowIP != "" {
-		if err := applyIptables(ctx, settings.WebAddress, allowIP); err != nil {
+	if strings.TrimSpace(settings.TelegramToken) == "" {
+		response, err := prompt(ctx, reader, "Telegram bot token (leave empty to skip): ", settings.TelegramToken)
+		if err != nil {
 			return Settings{}, err
 		}
+		settings.TelegramToken = response
 	}
-	settings.WebAllowIP = allowIP
+	if settings.TelegramToken != "" && strings.TrimSpace(settings.TelegramChatID) == "" {
+		response, err := prompt(ctx, reader, "Telegram chat ID: ", settings.TelegramChatID)
+		if err != nil {
+			return Settings{}, err
+		}
+		settings.TelegramChatID = response
+	}
+
+	if strings.TrimSpace(settings.WebAddress) == "" {
+		response, err := prompt(ctx, reader, fmt.Sprintf("Web port [%s]: ", defaultPort), defaultPort)
+		if err != nil {
+			return Settings{}, err
+		}
+		settings.WebAddress = normalizeAddress(response)
+	}
+
+	if strings.TrimSpace(settings.WebAllowIP) == "" {
+		allowIP, err := prompt(ctx, reader, "Lock web port to a single IP with iptables? (leave empty to skip): ", settings.WebAllowIP)
+		if err != nil {
+			return Settings{}, err
+		}
+		if allowIP != "" {
+			if err := applyIptables(ctx, settings.WebAddress, allowIP); err != nil {
+				return Settings{}, err
+			}
+		}
+		settings.WebAllowIP = allowIP
+	}
 
 	if settings.DatabaseDriver == "sqlite" && strings.TrimSpace(settings.DatabaseDSN) == "" {
 		settings.DatabaseDSN = defaultSQLitePath(settings.WebAddress)
@@ -172,14 +223,21 @@ func Run(ctx context.Context) (Settings, error) {
 
 // ---- Prompt helpers ----
 
-func prompt(reader *bufio.Reader, label, fallback string) string {
+func prompt(ctx context.Context, reader *bufio.Reader, label, fallback string) (string, error) {
+	// Keep prompts cancellable so Ctrl+C stops setup cleanly.
 	fmt.Print(label)
-	text, _ := reader.ReadString('\n')
+	text, err := reader.ReadString('\n')
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", err
+	}
 	text = strings.TrimSpace(text)
 	if text == "" {
-		return fallback
+		return fallback, nil
 	}
-	return text
+	return text, nil
 }
 
 func fallbackValue(value, fallback string) string {
@@ -292,13 +350,20 @@ func configureSSHKeys(ctx context.Context, reader *bufio.Reader, settings Settin
 		fmt.Println("SSH key setup skipped: database not configured.")
 		return nil
 	}
+	if records, err := sshkeys.LoadKeyringFromSettings(ctx); err == nil && len(records) > 0 {
+		fmt.Println("SSH key setup skipped: existing keys found.")
+		return nil
+	}
 	if err := tightenSQLitePermissions(settings.DatabaseDriver, settings.DatabaseDSN); err != nil {
 		fmt.Fprintf(os.Stderr, "setup: sqlite permissions warning: %v\n", err)
 	}
 
 	fmt.Println("\nSSH key setup (up to 3 keys):")
 	for index := 1; index <= 3; index++ {
-		choice := prompt(reader, fmt.Sprintf("Key %d: enter private key path, 'g' to generate, 'p' to paste, or leave empty to skip: ", index), "")
+		choice, err := prompt(ctx, reader, fmt.Sprintf("Key %d: enter private key path, 'g' to generate, 'p' to paste, or leave empty to skip: ", index), "")
+		if err != nil {
+			return err
+		}
 		if strings.TrimSpace(choice) == "" {
 			return nil
 		}
@@ -314,7 +379,10 @@ func configureSSHKeys(ctx context.Context, reader *bufio.Reader, settings Settin
 				return err
 			}
 		} else if strings.EqualFold(keyPath, "p") {
-			passphrase := promptPassphrase(reader, "Passphrase for this key (leave empty to keep none, or type 'g' to generate): ")
+			passphrase, err := promptPassphrase(ctx, reader, "Passphrase for this key (leave empty to keep none, or type 'g' to generate): ")
+			if err != nil {
+				return err
+			}
 			if strings.EqualFold(passphrase, "g") {
 				generatedPassphrase, err := randomPassphrase()
 				if err != nil {
@@ -323,7 +391,7 @@ func configureSSHKeys(ctx context.Context, reader *bufio.Reader, settings Settin
 				passphrase = generatedPassphrase
 				fmt.Printf("Generated passphrase: %s\n", passphrase)
 			}
-			label, privateKey, err := promptPrivateKeyPaste(reader)
+			label, privateKey, err := promptPrivateKeyPaste(ctx, reader)
 			if err != nil {
 				return err
 			}
@@ -336,7 +404,10 @@ func configureSSHKeys(ctx context.Context, reader *bufio.Reader, settings Settin
 				return err
 			}
 		} else {
-			passphrase := promptPassphrase(reader, "Passphrase for this key (leave empty to keep none, or type 'g' to generate): ")
+			passphrase, err := promptPassphrase(ctx, reader, "Passphrase for this key (leave empty to keep none, or type 'g' to generate): ")
+			if err != nil {
+				return err
+			}
 			if strings.EqualFold(passphrase, "g") {
 				generatedPassphrase, err := randomPassphrase()
 				if err != nil {
@@ -354,7 +425,10 @@ func configureSSHKeys(ctx context.Context, reader *bufio.Reader, settings Settin
 				return err
 			}
 		}
-		next := prompt(reader, "Add another SSH key? [y/N]: ", "N")
+		next, err := prompt(ctx, reader, "Add another SSH key? [y/N]: ", "N")
+		if err != nil {
+			return err
+		}
 		if strings.ToLower(next) != "y" {
 			return nil
 		}
@@ -431,14 +505,20 @@ func derivePublicKey(ctx context.Context, privateKey []byte) (string, error) {
 	return readPublicKey(ctx, path)
 }
 
-func promptPrivateKeyPaste(reader *bufio.Reader) (string, []byte, error) {
+func promptPrivateKeyPaste(ctx context.Context, reader *bufio.Reader) (string, []byte, error) {
 	// Accept multi-line pasted keys so operators can avoid storing files ahead of time.
 	fmt.Println("Paste private key contents, then finish with a single line containing END:")
-	label := prompt(reader, "Label for this key (optional): ", "")
+	label, err := prompt(ctx, reader, "Label for this key (optional): ", "")
+	if err != nil {
+		return "", nil, err
+	}
 	var lines []string
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
+			if ctx.Err() != nil {
+				return "", nil, ctx.Err()
+			}
 			return "", nil, err
 		}
 		text := strings.TrimRight(line, "\r\n")
@@ -453,10 +533,17 @@ func promptPrivateKeyPaste(reader *bufio.Reader) (string, []byte, error) {
 	return label, []byte(strings.Join(lines, "\n") + "\n"), nil
 }
 
-func promptPassphrase(reader *bufio.Reader, label string) string {
+func promptPassphrase(ctx context.Context, reader *bufio.Reader, label string) (string, error) {
+	// Read passphrases with cancellation support.
 	fmt.Print(label)
-	text, _ := reader.ReadString('\n')
-	return strings.TrimSpace(text)
+	text, err := reader.ReadString('\n')
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", err
+	}
+	return strings.TrimSpace(text), nil
 }
 
 func randomPassphrase() (string, error) {

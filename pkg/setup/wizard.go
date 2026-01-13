@@ -61,13 +61,13 @@ func Run(ctx context.Context) (Settings, error) {
 	}
 	defaultPort := fallbackValue(strings.TrimPrefix(stored.WebAddress, ":"), "4321")
 	if settings.DatabaseDriver == "postgres" {
-		settings.DatabaseDSN = prompt(reader, "Postgres DSN: ", stored.DatabaseDSN)
+		settings.DatabaseDSN = prompt(reader, fmt.Sprintf("Postgres DSN [%s]: ", stored.DatabaseDSN), stored.DatabaseDSN)
 	} else {
 		fallbackDSN := stored.DatabaseDSN
 		if fallbackDSN == "" {
 			fallbackDSN = defaultSQLitePath(":" + defaultPort)
 		}
-		settings.DatabaseDSN = prompt(reader, "SQLite database path: ", fallbackDSN)
+		settings.DatabaseDSN = prompt(reader, fmt.Sprintf("SQLite database path [%s]: ", fallbackDSN), fallbackDSN)
 	}
 	if strings.TrimSpace(settings.DatabaseDSN) != "" {
 		if storedFromDB, err := loadSettingsFromDB(settings.DatabaseDriver, settings.DatabaseDSN); err == nil {
@@ -93,12 +93,19 @@ func Run(ctx context.Context) (Settings, error) {
 	if err != nil {
 		return Settings{}, err
 	}
+	if !hasPrevious {
+		if dbSummary, ok, dbErr := loadImportSummaryFromDB(settings.DatabaseDriver, settings.DatabaseDSN); dbErr == nil && ok {
+			previousSummary = dbSummary
+			hasPrevious = true
+		}
+	}
 	if hasPrevious {
 		fmt.Printf("Previously imported: %d hosts, %d services, %d notifications (from %s).\n", previousSummary.Hosts, previousSummary.Services, previousSummary.Notifications, previousSummary.ConfigFileHint)
 	}
 	delta := buildImportDelta(summary, previousSummary, hasPrevious)
 	confirm := "Y"
 	if hasPrevious && delta.HasNoNew {
+		fmt.Println("All services already imported.")
 		confirm = prompt(reader, "No new inventory since last import. Skip import? [Y/n]: ", "Y")
 		if strings.ToLower(confirm) == "n" {
 			confirm = "Y"

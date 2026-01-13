@@ -201,7 +201,7 @@ func configureSSHKeys(ctx context.Context, reader *bufio.Reader, settings Settin
 
 	fmt.Println("\nSSH key setup (up to 3 keys):")
 	for index := 1; index <= 3; index++ {
-		choice := prompt(reader, fmt.Sprintf("Key %d: enter private key path, 'g' to generate, or leave empty to skip: ", index), "")
+		choice := prompt(reader, fmt.Sprintf("Key %d: enter private key path, 'g' to generate, 'p' to paste, or leave empty to skip: ", index), "")
 		if strings.TrimSpace(choice) == "" {
 			return nil
 		}
@@ -214,6 +214,28 @@ func configureSSHKeys(ctx context.Context, reader *bufio.Reader, settings Settin
 			fmt.Printf("Generated SSH key: %s\n", generated)
 			fmt.Printf("Public key:\n%s\n", publicKey)
 			if err := saveSSHKey(ctx, settings, generated, passphrase, publicKey); err != nil {
+				return err
+			}
+		} else if strings.EqualFold(keyPath, "p") {
+			passphrase := promptPassphrase(reader, "Passphrase for this key (leave empty to keep none, or type 'g' to generate): ")
+			if strings.EqualFold(passphrase, "g") {
+				generatedPassphrase, err := randomPassphrase()
+				if err != nil {
+					return err
+				}
+				passphrase = generatedPassphrase
+				fmt.Printf("Generated passphrase: %s\n", passphrase)
+			}
+			label, privateKey, err := promptPrivateKeyPaste(reader)
+			if err != nil {
+				return err
+			}
+			publicKey, err := derivePublicKey(ctx, privateKey)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Public key:\n%s\n", publicKey)
+			if err := saveSSHKeyData(ctx, settings, label, privateKey, passphrase, publicKey); err != nil {
 				return err
 			}
 		} else {
@@ -252,6 +274,15 @@ func saveSSHKey(ctx context.Context, settings Settings, path, passphrase, public
 	return sshkeys.SaveKey(ctx, settings.DatabaseDriver, settings.DatabaseDSN, label, publicKey, privateKey, []byte(passphrase))
 }
 
+func saveSSHKeyData(ctx context.Context, settings Settings, label string, privateKey []byte, passphrase, publicKey string) error {
+	// Save pasted keys with a label so the keyring can reference the source later.
+	cleanLabel := strings.TrimSpace(label)
+	if cleanLabel == "" {
+		cleanLabel = fmt.Sprintf("pasted-%d", time.Now().Unix())
+	}
+	return sshkeys.SaveKey(ctx, settings.DatabaseDriver, settings.DatabaseDSN, cleanLabel, publicKey, privateKey, []byte(passphrase))
+}
+
 func generateSSHKey() (string, string, string, error) {
 	passphrase, err := randomPassphrase()
 	if err != nil {
@@ -287,6 +318,42 @@ func readPublicKey(ctx context.Context, path string) (string, error) {
 		return "", fmt.Errorf("ssh-keygen -y failed: %s", strings.TrimSpace(string(output)))
 	}
 	return strings.TrimSpace(string(output)), nil
+}
+
+func derivePublicKey(ctx context.Context, privateKey []byte) (string, error) {
+	// Write pasted keys to a temp file so ssh-keygen can derive the public key.
+	dir := "/var/lib/chicha-pulse/ssh"
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, fmt.Sprintf("pasted_%d", time.Now().UnixNano()))
+	if err := os.WriteFile(path, privateKey, 0o600); err != nil {
+		return "", err
+	}
+	defer os.Remove(path)
+	return readPublicKey(ctx, path)
+}
+
+func promptPrivateKeyPaste(reader *bufio.Reader) (string, []byte, error) {
+	// Accept multi-line pasted keys so operators can avoid storing files ahead of time.
+	fmt.Println("Paste private key contents, then finish with a single line containing END:")
+	label := prompt(reader, "Label for this key (optional): ", "")
+	var lines []string
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return "", nil, err
+		}
+		text := strings.TrimRight(line, "\r\n")
+		if strings.TrimSpace(text) == "END" {
+			break
+		}
+		lines = append(lines, text)
+	}
+	if len(lines) == 0 {
+		return "", nil, fmt.Errorf("no key data provided")
+	}
+	return label, []byte(strings.Join(lines, "\n") + "\n"), nil
 }
 
 func promptPassphrase(reader *bufio.Reader, label string) string {

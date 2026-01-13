@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ import (
 const (
 	masterKeyPath   = "/var/lib/chicha-pulse/sshkey.master"
 	settingsPath    = "/var/lib/chicha-pulse/settings.conf"
+	keyringFilePath = "/var/lib/chicha-pulse/sshkeys.json"
 	keyringTableSQL = `CREATE TABLE IF NOT EXISTS setup_ssh_keys (
 id TEXT,
 label TEXT,
@@ -57,19 +59,6 @@ func EnsureKeyring(ctx context.Context, driverName, dsn string) error {
 
 // SaveKey encrypts and stores key material so future checks can reuse it.
 func SaveKey(ctx context.Context, driverName, dsn, label, publicKey string, privateKey, passphrase []byte) error {
-	if strings.TrimSpace(driverName) == "" || strings.TrimSpace(dsn) == "" {
-		return nil
-	}
-	db, err := sql.Open(driverName, dsn)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	if _, err := db.ExecContext(ctx, keyringTableSQL); err != nil {
-		return err
-	}
-
 	masterKey, err := loadOrCreateMasterKey()
 	if err != nil {
 		return err
@@ -80,6 +69,22 @@ func SaveKey(ctx context.Context, driverName, dsn, label, publicKey string, priv
 	}
 	passphraseEnc, err := encrypt(masterKey, passphrase)
 	if err != nil {
+		return err
+	}
+	if err := saveKeyFileRecord(label, publicKey, privateKeyEnc, passphraseEnc); err != nil {
+		return err
+	}
+
+	if strings.TrimSpace(driverName) == "" || strings.TrimSpace(dsn) == "" {
+		return nil
+	}
+	db, err := sql.Open(driverName, dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	if _, err := db.ExecContext(ctx, keyringTableSQL); err != nil {
 		return err
 	}
 
@@ -107,7 +112,7 @@ id, label, public_key, private_key_enc, passphrase_enc, created_at
 // LoadKeyring returns up to the most recent three keys so SSH checks can try them in order.
 func LoadKeyring(ctx context.Context, driverName, dsn string) ([]KeyRecord, error) {
 	if strings.TrimSpace(driverName) == "" || strings.TrimSpace(dsn) == "" {
-		return nil, nil
+		return loadKeyringFile()
 	}
 	db, err := sql.Open(driverName, dsn)
 	if err != nil {
@@ -119,6 +124,9 @@ func LoadKeyring(ctx context.Context, driverName, dsn string) ([]KeyRecord, erro
 FROM setup_ssh_keys ORDER BY created_at DESC LIMIT 3`
 	rows, err := db.QueryContext(ctx, statement)
 	if err != nil {
+		if isUnsupportedQuery(err) {
+			return loadKeyringFile()
+		}
 		return nil, err
 	}
 	defer rows.Close()
@@ -163,7 +171,7 @@ func LoadKeyringFromSettings(ctx context.Context) ([]KeyRecord, error) {
 	values, err := readSettingsFile()
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
+			return loadKeyringFile()
 		}
 		return nil, err
 	}
@@ -191,6 +199,15 @@ func readSettingsFile() (map[string]string, error) {
 	return values, nil
 }
 
+type keyringFileRecord struct {
+	ID           string `json:"id"`
+	Label        string `json:"label"`
+	PublicKey    string `json:"public_key"`
+	PrivateKey   string `json:"private_key_enc"`
+	Passphrase   string `json:"passphrase_enc"`
+	CreatedAtUTC string `json:"created_at"`
+}
+
 func loadOrCreateMasterKey() ([]byte, error) {
 	if data, err := os.ReadFile(masterKeyPath); err == nil {
 		return data, nil
@@ -206,6 +223,95 @@ func loadOrCreateMasterKey() ([]byte, error) {
 		return nil, err
 	}
 	return key, nil
+}
+
+func saveKeyFileRecord(label, publicKey, privateKeyEnc, passphraseEnc string) error {
+	// Store key data on disk so placeholder SQL drivers still have SSH keys available.
+	records, err := readKeyringFileRaw()
+	if err != nil {
+		return err
+	}
+	record := keyringFileRecord{
+		ID:           fmt.Sprintf("%d", time.Now().UnixNano()),
+		Label:        label,
+		PublicKey:    publicKey,
+		PrivateKey:   privateKeyEnc,
+		Passphrase:   passphraseEnc,
+		CreatedAtUTC: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	records = append([]keyringFileRecord{record}, records...)
+	if len(records) > 3 {
+		records = records[:3]
+	}
+	return writeKeyringFile(records)
+}
+
+func loadKeyringFile() ([]KeyRecord, error) {
+	// Load key material from disk when SQL drivers cannot handle queries.
+	raw, err := readKeyringFileRaw()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	masterKey, err := loadOrCreateMasterKey()
+	if err != nil {
+		return nil, err
+	}
+	var records []KeyRecord
+	for _, item := range raw {
+		privateKey, err := decrypt(masterKey, item.PrivateKey)
+		if err != nil {
+			return nil, err
+		}
+		passphrase, err := decrypt(masterKey, item.Passphrase)
+		if err != nil {
+			return nil, err
+		}
+		record := KeyRecord{
+			ID:         item.ID,
+			Label:      item.Label,
+			PublicKey:  item.PublicKey,
+			PrivateKey: privateKey,
+			Passphrase: passphrase,
+		}
+		if item.CreatedAtUTC != "" {
+			if parsed, err := time.Parse(time.RFC3339Nano, item.CreatedAtUTC); err == nil {
+				record.CreatedAt = parsed
+			}
+		}
+		records = append(records, record)
+	}
+	return records, nil
+}
+
+func readKeyringFileRaw() ([]keyringFileRecord, error) {
+	data, err := os.ReadFile(keyringFilePath)
+	if err != nil {
+		return nil, err
+	}
+	var records []keyringFileRecord
+	if err := json.Unmarshal(data, &records); err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+func writeKeyringFile(records []keyringFileRecord) error {
+	if err := os.MkdirAll(filepath.Dir(keyringFilePath), 0o700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(records, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(keyringFilePath, data, 0o600)
+}
+
+func isUnsupportedQuery(err error) bool {
+	// Detect placeholder SQL drivers that do not support QueryContext.
+	return strings.Contains(err.Error(), "query not supported")
 }
 
 func encrypt(key []byte, plaintext []byte) (string, error) {

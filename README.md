@@ -13,6 +13,22 @@ One binary. One pulse.
 
 ---
 
+## Core Idea
+
+chicha-pulse does **not lock you into its control plane**.
+
+You can manage your infrastructure in **two ways**:
+- through **chicha-pulse**
+- or **directly**, using native Linux tools, hypervisors, and workflows
+
+chicha-pulse continuously observes the system state, **detects external changes**, and automatically **integrates them back into its inventory and control model**.
+
+No forced workflows.  
+No abstraction prison.  
+Your infrastructure stays yours.
+
+---
+
 ## Key Features
 
 - **Single static binary**
@@ -21,6 +37,7 @@ One binary. One pulse.
 - Server and VM inventory
 - Virtual machine lifecycle management
 - Live VM migration
+- External state discovery and reconciliation
 - Unified control plane (CLI + API)
 - Embedded storage and web UI
 
@@ -30,11 +47,15 @@ One binary. One pulse.
 
 chicha-pulse is designed to be:
 - simple to deploy
-- easy to operate
-- predictable in production
+- safe to operate
+- transparent to infrastructure changes
 
-No complex stacks. No service sprawl.  
-Everything you need — in one pulse.
+You are free to:
+- create or modify VMs manually
+- change system configuration directly
+- migrate workloads outside of chicha-pulse
+
+chicha-pulse will detect, understand, and reflect those changes — without breaking state or forcing rewrites.
 
 ---
 

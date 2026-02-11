@@ -25,6 +25,7 @@ const (
 	RoleServersView    Role = "servers:view"
 	RoleMonitoringView Role = "monitoring:view"
 	RoleMonitoringEdit Role = "monitoring:edit"
+	defaultSuperuser        = "superuser"
 )
 
 const defaultSaltByteCount = 16
@@ -152,9 +153,10 @@ func (req ensureDefaultRequest) apply(mgr *Manager) {
 		req.response <- defaultResponse{}
 		return
 	}
-	username := "admin-" + randomToken(6)
+	username := defaultSuperuser
 	password := randomToken(24)
-	roles := []Role{RoleAdmin}
+	// Keep explicit monitoring roles so superuser behavior is obvious in both code and UI checks.
+	roles := []Role{RoleAdmin, RoleServersView, RoleMonitoringView, RoleMonitoringEdit}
 	salt := randomSalt()
 	hash := hashPassword(password, salt)
 	now := time.Now().UTC()

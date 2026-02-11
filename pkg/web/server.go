@@ -1318,20 +1318,18 @@ const indexTemplate = `<!doctype html>
           {{if .SSHCommand}}<span class="meta"> cmd {{.SSHCommand}}</span>{{end}}
           {{if .CheckedAt}}<div class="meta">Checked: {{.CheckedAt}} — {{.Output}}</div>{{end}}
           {{if $.CanEditMonitoring}}
-            <details>
-              <summary>Edit monitoring task</summary>
-              <form method="post" action="/services/update">
-                <input type="hidden" name="host" value="{{.HostName}}" />
-                <input type="hidden" name="service" value="{{.Name}}" />
-                <div><input type="text" name="command" value="{{.RawCommand}}" placeholder="Check command" /></div>
-                <div><input type="text" name="notes" value="{{.Notes}}" placeholder="Notes" /></div>
-                <div><input type="number" name="interval" value="{{.Interval}}" placeholder="Interval minutes" /></div>
-                <div><input type="text" name="ssh_user" value="{{.SSHUser}}" placeholder="SSH user" /></div>
-                <div><input type="text" name="ssh_key_path" value="{{.SSHKeyPath}}" placeholder="SSH key path" /></div>
-                <div><input type="text" name="ssh_command" value="{{.SSHCommand}}" placeholder="SSH command" /></div>
-                <button type="submit">Save</button>
-              </form>
-            </details>
+            <form method="post" action="/services/update">
+              <input type="hidden" name="host" value="{{.HostName}}" />
+              <input type="hidden" name="service" value="{{.Name}}" />
+              <div class="meta"><strong>Edit monitoring task</strong></div>
+              <div><input type="text" name="command" value="{{.RawCommand}}" placeholder="Check command" /></div>
+              <div><input type="text" name="notes" value="{{.Notes}}" placeholder="Notes" /></div>
+              <div><input type="number" name="interval" value="{{.Interval}}" placeholder="Interval minutes" /></div>
+              <div><input type="text" name="ssh_user" value="{{.SSHUser}}" placeholder="SSH user" /></div>
+              <div><input type="text" name="ssh_key_path" value="{{.SSHKeyPath}}" placeholder="SSH key path" /></div>
+              <div><input type="text" name="ssh_command" value="{{.SSHCommand}}" placeholder="SSH command" /></div>
+              <button type="submit">Save monitoring task</button>
+            </form>
           {{end}}
         </li>
       {{end}}
@@ -1421,20 +1419,18 @@ const hostsTemplate = `{{range .Heads}}
           {{if .SSHCommand}}<span class="meta"> cmd {{.SSHCommand}}</span>{{end}}
           {{if .CheckedAt}}<div class="meta">Checked: {{.CheckedAt}} — {{.Output}}</div>{{end}}
           {{if $.CanEditMonitoring}}
-            <details>
-              <summary>Edit monitoring task</summary>
-              <form method="post" action="/services/update">
-                <input type="hidden" name="host" value="{{.HostName}}" />
-                <input type="hidden" name="service" value="{{.Name}}" />
-                <div><input type="text" name="command" value="{{.RawCommand}}" placeholder="Check command" /></div>
-                <div><input type="text" name="notes" value="{{.Notes}}" placeholder="Notes" /></div>
-                <div><input type="number" name="interval" value="{{.Interval}}" placeholder="Interval minutes" /></div>
-                <div><input type="text" name="ssh_user" value="{{.SSHUser}}" placeholder="SSH user" /></div>
-                <div><input type="text" name="ssh_key_path" value="{{.SSHKeyPath}}" placeholder="SSH key path" /></div>
-                <div><input type="text" name="ssh_command" value="{{.SSHCommand}}" placeholder="SSH command" /></div>
-                <button type="submit">Save</button>
-              </form>
-            </details>
+            <form method="post" action="/services/update">
+              <input type="hidden" name="host" value="{{.HostName}}" />
+              <input type="hidden" name="service" value="{{.Name}}" />
+              <div class="meta"><strong>Edit monitoring task</strong></div>
+              <div><input type="text" name="command" value="{{.RawCommand}}" placeholder="Check command" /></div>
+              <div><input type="text" name="notes" value="{{.Notes}}" placeholder="Notes" /></div>
+              <div><input type="number" name="interval" value="{{.Interval}}" placeholder="Interval minutes" /></div>
+              <div><input type="text" name="ssh_user" value="{{.SSHUser}}" placeholder="SSH user" /></div>
+              <div><input type="text" name="ssh_key_path" value="{{.SSHKeyPath}}" placeholder="SSH key path" /></div>
+              <div><input type="text" name="ssh_command" value="{{.SSHCommand}}" placeholder="SSH command" /></div>
+              <button type="submit">Save monitoring task</button>
+            </form>
           {{end}}
         </li>
       {{end}}

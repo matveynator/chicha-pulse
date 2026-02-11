@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"flag"
@@ -16,6 +15,7 @@ import (
 
 	"chicha-pulse/pkg/activity"
 	"chicha-pulse/pkg/alert"
+	"chicha-pulse/pkg/auth"
 	"chicha-pulse/pkg/checker"
 	"chicha-pulse/pkg/model"
 	"chicha-pulse/pkg/nagiosimport"
@@ -124,14 +124,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	auth := generateAuth()
-	log.Printf("web auth username: %s", auth.Username)
-	log.Printf("web auth password: %s", auth.Password)
-	if err := storage.SaveAuth(ctx, database, auth); err != nil {
-		log.Printf("failed to store web credentials: %v", err)
+	authManager, err := auth.NewManager(ctx, database.Database(), database.DriverName())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	username, password, err := authManager.EnsureDefaultAdmin(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if username != "" && password != "" {
+		log.Printf("web admin username: %s", username)
+		log.Printf("web admin password: %s", password)
 	}
 
-	srv, err := web.NewServer(st, auth, config.PageTitle, config.WebAllowIPs)
+	srv, err := web.NewServer(st, authManager, config.PageTitle, config.WebAllowIPs)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -325,28 +333,6 @@ func modelStatus(result checker.Result) model.ServiceStatus {
 
 func statusKey(result checker.Result) string {
 	return result.HostName + "/" + result.ServiceName
-}
-
-// ---- Web auth ----
-
-func generateAuth() web.AuthConfig {
-	return web.AuthConfig{
-		Username: randomToken(12),
-		Password: randomToken(32),
-	}
-}
-
-func randomToken(length int) string {
-	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	bytes := make([]byte, length)
-	_, err := rand.Read(bytes)
-	if err != nil {
-		return fmt.Sprintf("fallback-%d", time.Now().UnixNano())
-	}
-	for i := range bytes {
-		bytes[i] = alphabet[int(bytes[i])%len(alphabet)]
-	}
-	return string(bytes)
 }
 
 // ---- Cleanup ----

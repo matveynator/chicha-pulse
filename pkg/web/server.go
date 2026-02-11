@@ -770,6 +770,10 @@ func buildHostView(host *model.Host, parents map[string][]*model.Host, inventory
 	}
 
 	label, class := hostStatus(host, inventory)
+	if !perms.CanViewMonitoring {
+		// Hide live health signals from users who are not allowed to inspect monitoring state.
+		label, class = "RESTRICTED", "status-unknown"
+	}
 
 	return hostView{
 		Name:        host.Name,
@@ -1082,6 +1086,8 @@ const indexTemplate = `<!doctype html>
           <input type="text" name="group" placeholder="New group" />
           <button type="submit">Add group</button>
         </form>
+      {{else}}
+        <div class="meta">Editing buttons are hidden because monitoring:edit role is not assigned.</div>
       {{end}}
       {{if .Groups}}
         {{range .Groups}}
@@ -1145,6 +1151,11 @@ const indexTemplate = `<!doctype html>
       {{else}}
         <div class="meta">No users found.</div>
       {{end}}
+    </div>
+  {{else}}
+    <div class="card">
+      <h2>User access</h2>
+      <div class="meta">User management buttons are visible only for admin role.</div>
     </div>
   {{end}}
   <script>
@@ -1279,7 +1290,7 @@ const indexTemplate = `<!doctype html>
 {{define "hostsTree"}}
   {{range .Heads}}
     <div class="host {{.StatusClass}}">
-      <h2>{{.Name}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></h2>
+      <h2>{{.Name}}{{if $.CanViewMonitoring}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span>{{end}}</h2>
       {{if .Address}}<div class="meta">Address: {{.Address}}</div>{{end}}
       {{if .OSName}}<div class="meta">OS: {{.OSLogo}} {{.OSName}} {{.OSVersion}}</div>{{end}}
       {{if .Group}}<div class="meta">Group: {{.Group}}</div>{{end}}
@@ -1303,7 +1314,7 @@ const indexTemplate = `<!doctype html>
   {{end}}
 {{end}}
 {{define "services"}}
-  {{if and .Services $.CanViewMonitoring}}
+  {{if $.CanViewMonitoring}}
     <h3>Services</h3>
     <ul class="services">
       {{range .Services}}
@@ -1334,6 +1345,20 @@ const indexTemplate = `<!doctype html>
         </li>
       {{end}}
     </ul>
+    {{if $.CanEditMonitoring}}
+      <form method="post" action="/services/update">
+        <input type="hidden" name="host" value="{{.Name}}" />
+        <div class="meta"><strong>Add monitoring task</strong></div>
+        <div><input type="text" name="service" placeholder="Service name" /></div>
+        <div><input type="text" name="command" placeholder="Check command" /></div>
+        <div><input type="text" name="notes" placeholder="Notes" /></div>
+        <div><input type="number" name="interval" placeholder="Interval minutes" /></div>
+        <div><input type="text" name="ssh_user" placeholder="SSH user" /></div>
+        <div><input type="text" name="ssh_key_path" placeholder="SSH key path" /></div>
+        <div><input type="text" name="ssh_command" placeholder="SSH command" /></div>
+        <button type="submit">Add monitoring task</button>
+      </form>
+    {{end}}
   {{end}}
 {{end}}
 {{define "guests"}}
@@ -1341,7 +1366,7 @@ const indexTemplate = `<!doctype html>
     <h3>Virtual machines</h3>
     {{range .Guests}}
       <div class="guest {{.StatusClass}}">
-        <h4>{{.Name}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></h4>
+        <h4>{{.Name}}{{if $.CanViewMonitoring}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span>{{end}}</h4>
         {{if .Address}}<div class="meta">Address: {{.Address}}</div>{{end}}
         {{if .OSName}}<div class="meta">OS: {{.OSLogo}} {{.OSName}} {{.OSVersion}}</div>{{end}}
         {{template "services" .}}
@@ -1381,7 +1406,7 @@ const alertsTemplate = `{{if .Alerts}}
 
 const hostsTemplate = `{{range .Heads}}
   <div class="host {{.StatusClass}}">
-    <h2>{{.Name}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></h2>
+    <h2>{{.Name}}{{if $.CanViewMonitoring}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span>{{end}}</h2>
     {{if .Address}}<div class="meta">Address: {{.Address}}</div>{{end}}
     {{if .OSName}}<div class="meta">OS: {{.OSLogo}} {{.OSName}} {{.OSVersion}}</div>{{end}}
     {{if .Group}}<div class="meta">Group: {{.Group}}</div>{{end}}
@@ -1404,7 +1429,7 @@ const hostsTemplate = `{{range .Heads}}
   <p>No hosts imported yet.</p>
 {{end}}
 {{define "services"}}
-  {{if and .Services $.CanViewMonitoring}}
+  {{if $.CanViewMonitoring}}
     <h3>Services</h3>
     <ul class="services">
       {{range .Services}}
@@ -1435,6 +1460,20 @@ const hostsTemplate = `{{range .Heads}}
         </li>
       {{end}}
     </ul>
+    {{if $.CanEditMonitoring}}
+      <form method="post" action="/services/update">
+        <input type="hidden" name="host" value="{{.Name}}" />
+        <div class="meta"><strong>Add monitoring task</strong></div>
+        <div><input type="text" name="service" placeholder="Service name" /></div>
+        <div><input type="text" name="command" placeholder="Check command" /></div>
+        <div><input type="text" name="notes" placeholder="Notes" /></div>
+        <div><input type="number" name="interval" placeholder="Interval minutes" /></div>
+        <div><input type="text" name="ssh_user" placeholder="SSH user" /></div>
+        <div><input type="text" name="ssh_key_path" placeholder="SSH key path" /></div>
+        <div><input type="text" name="ssh_command" placeholder="SSH command" /></div>
+        <button type="submit">Add monitoring task</button>
+      </form>
+    {{end}}
   {{end}}
 {{end}}
 {{define "guests"}}
@@ -1442,7 +1481,7 @@ const hostsTemplate = `{{range .Heads}}
     <h3>Virtual machines</h3>
     {{range .Guests}}
       <div class="guest {{.StatusClass}}">
-        <h4>{{.Name}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></h4>
+        <h4>{{.Name}}{{if $.CanViewMonitoring}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span>{{end}}</h4>
         {{if .Address}}<div class="meta">Address: {{.Address}}</div>{{end}}
         {{if .OSName}}<div class="meta">OS: {{.OSLogo}} {{.OSName}} {{.OSVersion}}</div>{{end}}
         {{template "services" .}}

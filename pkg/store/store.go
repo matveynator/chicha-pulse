@@ -44,6 +44,19 @@ type serviceUpdateRequest struct {
 	sshUser     string
 	sshKeyPath  string
 	sshCommand  string
+	response    chan error
+}
+
+type serviceAddRequest struct {
+	hostName    string
+	serviceName string
+	command     string
+	notes       string
+	interval    int
+	sshUser     string
+	sshKeyPath  string
+	sshCommand  string
+	response    chan error
 }
 
 type subscribeRequest struct {
@@ -77,6 +90,7 @@ type Store struct {
 	groupAdds     chan groupRequest
 	groupAssigns  chan assignRequest
 	serviceEdits  chan serviceUpdateRequest
+	serviceAdds   chan serviceAddRequest
 	subscribes    chan subscribeRequest
 	unsubscribes  chan unsubscribeRequest
 	hostMeta      chan hostMetaRequest
@@ -92,6 +106,7 @@ func New(ctx context.Context) *Store {
 		groupAdds:     make(chan groupRequest),
 		groupAssigns:  make(chan assignRequest),
 		serviceEdits:  make(chan serviceUpdateRequest),
+		serviceAdds:   make(chan serviceAddRequest),
 		subscribes:    make(chan subscribeRequest),
 		unsubscribes:  make(chan unsubscribeRequest),
 		hostMeta:      make(chan hostMetaRequest),
@@ -159,6 +174,7 @@ func (st *Store) AssignHostGroup(ctx context.Context, hostName, group string) er
 
 // UpdateService edits a monitoring task without racing over the shared inventory.
 func (st *Store) UpdateService(ctx context.Context, hostName, serviceName, command, notes string, interval int, sshUser, sshKeyPath, sshCommand string) error {
+	response := make(chan error, 1)
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -171,8 +187,40 @@ func (st *Store) UpdateService(ctx context.Context, hostName, serviceName, comma
 		sshUser:     sshUser,
 		sshKeyPath:  sshKeyPath,
 		sshCommand:  sshCommand,
+		response:    response,
 	}:
-		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-response:
+		return err
+	}
+}
+
+// AddService creates a new monitoring task and fails when host/service identity is invalid.
+func (st *Store) AddService(ctx context.Context, hostName, serviceName, command, notes string, interval int, sshUser, sshKeyPath, sshCommand string) error {
+	response := make(chan error, 1)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case st.serviceAdds <- serviceAddRequest{
+		hostName:    hostName,
+		serviceName: serviceName,
+		command:     command,
+		notes:       notes,
+		interval:    interval,
+		sshUser:     sshUser,
+		sshKeyPath:  sshKeyPath,
+		sshCommand:  sshCommand,
+		response:    response,
+	}:
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-response:
+		return err
 	}
 }
 
@@ -258,8 +306,28 @@ func (st *Store) run(ctx context.Context) {
 			}
 			publishSnapshot(inventory, subscribers)
 		case update := <-st.serviceEdits:
-			host := ensureHost(&inventory, update.hostName)
-			applyServiceUpdate(host, update)
+			host, ok := inventory.Hosts[update.hostName]
+			if !ok {
+				update.response <- fmt.Errorf("host %s not found", update.hostName)
+				continue
+			}
+			if err := applyServiceUpdate(host, update); err != nil {
+				update.response <- err
+				continue
+			}
+			update.response <- nil
+			publishSnapshot(inventory, subscribers)
+		case add := <-st.serviceAdds:
+			host, ok := inventory.Hosts[add.hostName]
+			if !ok {
+				add.response <- fmt.Errorf("host %s not found", add.hostName)
+				continue
+			}
+			if err := applyServiceAdd(host, add); err != nil {
+				add.response <- err
+				continue
+			}
+			add.response <- nil
 			publishSnapshot(inventory, subscribers)
 		case request := <-st.requests:
 			request.response <- inventory.Clone()
@@ -366,18 +434,8 @@ func applyCommand(inventory *model.Inventory, command nagiosimport.CommandDefini
 	inventory.Commands[command.Name] = command.Command
 }
 
-func ensureHost(inventory *model.Inventory, hostName string) *model.Host {
-	// Create a host placeholder so updates never panic on missing entries.
-	host, ok := inventory.Hosts[hostName]
-	if !ok {
-		host = &model.Host{Name: hostName}
-		inventory.Hosts[hostName] = host
-	}
-	return host
-}
-
-func applyServiceUpdate(host *model.Host, update serviceUpdateRequest) {
-	// Update in place so the scheduler picks changes up on the next tick.
+func applyServiceUpdate(host *model.Host, update serviceUpdateRequest) error {
+	// Edit must be strict so typos do not create unintended checks.
 	for index := range host.Services {
 		service := &host.Services[index]
 		if service.Name != update.serviceName {
@@ -389,18 +447,30 @@ func applyServiceUpdate(host *model.Host, update serviceUpdateRequest) {
 		service.SSHUser = strings.TrimSpace(update.sshUser)
 		service.SSHKeyPath = strings.TrimSpace(update.sshKeyPath)
 		service.SSHCommand = strings.TrimSpace(update.sshCommand)
-		return
+		return nil
+	}
+	return fmt.Errorf("service %s not found on host %s", update.serviceName, host.Name)
+}
+
+func applyServiceAdd(host *model.Host, add serviceAddRequest) error {
+	// Add path is separate from edit path to keep intent explicit and safe.
+	if strings.TrimSpace(add.serviceName) == "" {
+		return fmt.Errorf("service name is required")
+	}
+	if serviceExists(host.Services, add.serviceName) {
+		return fmt.Errorf("service %s already exists on host %s", add.serviceName, host.Name)
 	}
 	host.Services = append(host.Services, model.Service{
-		Name:                 update.serviceName,
+		Name:                 strings.TrimSpace(add.serviceName),
 		HostName:             host.Name,
-		CheckCommand:         strings.TrimSpace(update.command),
-		Notes:                strings.TrimSpace(update.notes),
-		CheckIntervalMinutes: update.interval,
-		SSHUser:              strings.TrimSpace(update.sshUser),
-		SSHKeyPath:           strings.TrimSpace(update.sshKeyPath),
-		SSHCommand:           strings.TrimSpace(update.sshCommand),
+		CheckCommand:         strings.TrimSpace(add.command),
+		Notes:                strings.TrimSpace(add.notes),
+		CheckIntervalMinutes: add.interval,
+		SSHUser:              strings.TrimSpace(add.sshUser),
+		SSHKeyPath:           strings.TrimSpace(add.sshKeyPath),
+		SSHCommand:           strings.TrimSpace(add.sshCommand),
 	})
+	return nil
 }
 
 func expandCommand(commands map[string]string, raw string) string {

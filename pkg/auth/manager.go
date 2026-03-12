@@ -122,7 +122,11 @@ func (req createUserRequest) apply(mgr *Manager) {
 		UpdatedAt:    now,
 	}
 	mgr.users[key] = user
-	mgr.enqueuePersist(persistRequest{kind: persistUserUpsert, user: user})
+	if err := mgr.enqueuePersist(persistRequest{kind: persistUserUpsert, user: user}); err != nil {
+		delete(mgr.users, key)
+		req.response <- err
+		return
+	}
 	req.response <- nil
 }
 
@@ -169,7 +173,11 @@ func (req ensureDefaultRequest) apply(mgr *Manager) {
 		UpdatedAt:    now,
 	}
 	mgr.users[strings.ToLower(username)] = user
-	mgr.enqueuePersist(persistRequest{kind: persistUserUpsert, user: user})
+	if err := mgr.enqueuePersist(persistRequest{kind: persistUserUpsert, user: user}); err != nil {
+		delete(mgr.users, strings.ToLower(username))
+		req.response <- defaultResponse{err: err}
+		return
+	}
 	req.response <- defaultResponse{username: username, password: password}
 }
 
@@ -289,11 +297,15 @@ type persistRequest struct {
 	user User
 }
 
-func (mgr *Manager) enqueuePersist(request persistRequest) {
+func (mgr *Manager) enqueuePersist(request persistRequest) error {
+	if mgr.storage == nil {
+		return nil
+	}
 	select {
 	case mgr.persistWrites <- request:
+		return nil
 	default:
-		log.Printf("auth persistence queue is full; write skipped")
+		return errors.New("auth persistence queue is full")
 	}
 }
 

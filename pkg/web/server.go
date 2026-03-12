@@ -79,6 +79,7 @@ func (srv *Server) Handler() http.Handler {
 	mux.HandleFunc("/events/hosts", srv.handleHostsEvents)
 	mux.HandleFunc("/groups", srv.handleAddGroup)
 	mux.HandleFunc("/assign", srv.handleAssignGroup)
+	mux.HandleFunc("/services/add", srv.handleServiceAdd)
 	mux.HandleFunc("/services/update", srv.handleServiceUpdate)
 	mux.HandleFunc("/services/test", srv.handleServiceTest)
 	mux.HandleFunc("/users", srv.handleUsers)
@@ -331,7 +332,42 @@ func (srv *Server) handleServiceUpdate(writer http.ResponseWriter, request *http
 		http.Error(writer, "missing host or service", http.StatusBadRequest)
 		return
 	}
-	_ = srv.store.UpdateService(request.Context(), host, service, command, notes, interval, sshUser, sshKeyPath, sshCommand)
+	if err := srv.store.UpdateService(request.Context(), host, service, command, notes, interval, sshUser, sshKeyPath, sshCommand); err != nil {
+		http.Error(writer, err.Error(), http.StatusBadRequest)
+		return
+	}
+	http.Redirect(writer, request, "/", http.StatusSeeOther)
+}
+
+func (srv *Server) handleServiceAdd(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		http.Redirect(writer, request, "/", http.StatusSeeOther)
+		return
+	}
+	if !srv.permissionsFromRequest(request).CanEditMonitoring {
+		http.Error(writer, "forbidden", http.StatusForbidden)
+		return
+	}
+	if err := request.ParseForm(); err != nil {
+		http.Error(writer, "invalid form", http.StatusBadRequest)
+		return
+	}
+	host := strings.TrimSpace(request.FormValue("host"))
+	service := strings.TrimSpace(request.FormValue("service"))
+	command := strings.TrimSpace(request.FormValue("command"))
+	notes := strings.TrimSpace(request.FormValue("notes"))
+	interval, _ := strconv.Atoi(strings.TrimSpace(request.FormValue("interval")))
+	sshUser := strings.TrimSpace(request.FormValue("ssh_user"))
+	sshKeyPath := strings.TrimSpace(request.FormValue("ssh_key_path"))
+	sshCommand := strings.TrimSpace(request.FormValue("ssh_command"))
+	if host == "" || service == "" {
+		http.Error(writer, "missing host or service", http.StatusBadRequest)
+		return
+	}
+	if err := srv.store.AddService(request.Context(), host, service, command, notes, interval, sshUser, sshKeyPath, sshCommand); err != nil {
+		http.Error(writer, err.Error(), http.StatusBadRequest)
+		return
+	}
 	http.Redirect(writer, request, "/", http.StatusSeeOther)
 }
 
@@ -683,7 +719,7 @@ func buildView(inventory model.Inventory, title string, perms permissions, users
 		sort.Slice(headViews, func(i, j int) bool {
 			return headViews[i].Name < headViews[j].Name
 		})
-		groupViews, groupNames = buildGroups(inventory)
+		groupViews, groupNames = buildGroups(inventory, perms)
 	}
 
 	if perms.CanViewMonitoring {
@@ -715,7 +751,7 @@ func buildAlertsPayload(alerts []alertView) alertsPayload {
 
 func buildHostsPayload(heads []hostView, inventory model.Inventory, perms permissions) hostsPayload {
 	// Include group names so the host assignment dropdown stays current.
-	_, groupNames := buildGroups(inventory)
+	_, groupNames := buildGroups(inventory, perms)
 	return hostsPayload{
 		Heads:             heads,
 		GroupNames:        groupNames,
@@ -751,7 +787,7 @@ func resolveHostParents(host *model.Host) []string {
 	return append([]string(nil), host.Parents...)
 }
 
-func buildGroups(inventory model.Inventory) ([]groupView, []string) {
+func buildGroups(inventory model.Inventory, perms permissions) ([]groupView, []string) {
 	var names []string
 	for name := range inventory.Groups {
 		names = append(names, name)
@@ -766,6 +802,9 @@ func buildGroups(inventory model.Inventory) ([]groupView, []string) {
 				continue
 			}
 			label, class := hostStatus(host, inventory)
+			if !perms.CanViewMonitoring {
+				label, class = "RESTRICTED", "status-unknown"
+			}
 			hosts = append(hosts, hostSummary{Name: host.Name, StatusLabel: label, StatusClass: class})
 		}
 		sort.Slice(hosts, func(i, j int) bool {
@@ -1176,7 +1215,7 @@ const indexTemplate = `<!doctype html>
           {{if .Hosts}}
             <ul>
               {{range .Hosts}}
-                <li><span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span> {{.Name}}</li>
+                <li>{{if $.CanViewMonitoring}}<span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span> {{end}}{{.Name}}</li>
               {{end}}
             </ul>
           {{else}}
@@ -1475,7 +1514,7 @@ const indexTemplate = `<!doctype html>
       {{end}}
     </ul>
     {{if $.CanEditMonitoring}}
-      <form method="post" action="/services/update">
+      <form method="post" action="/services/add">
         <input type="hidden" name="host" value="{{.Name}}" />
         <div class="meta"><strong>Add monitoring task</strong></div>
         <div><input type="text" name="service" placeholder="Service name" /></div>
@@ -1597,7 +1636,7 @@ const hostsTemplate = `{{range .Heads}}
       {{end}}
     </ul>
     {{if $.CanEditMonitoring}}
-      <form method="post" action="/services/update">
+      <form method="post" action="/services/add">
         <input type="hidden" name="host" value="{{.Name}}" />
         <div class="meta"><strong>Add monitoring task</strong></div>
         <div><input type="text" name="service" placeholder="Service name" /></div>

@@ -35,6 +35,30 @@ type assignRequest struct {
 	group    string
 }
 
+type serviceUpdateRequest struct {
+	hostName    string
+	serviceName string
+	command     string
+	notes       string
+	interval    int
+	sshUser     string
+	sshKeyPath  string
+	sshCommand  string
+	response    chan error
+}
+
+type serviceAddRequest struct {
+	hostName    string
+	serviceName string
+	command     string
+	notes       string
+	interval    int
+	sshUser     string
+	sshKeyPath  string
+	sshCommand  string
+	response    chan error
+}
+
 type subscribeRequest struct {
 	response chan chan model.Inventory
 }
@@ -65,6 +89,8 @@ type Store struct {
 	statusUpdates chan statusRequest
 	groupAdds     chan groupRequest
 	groupAssigns  chan assignRequest
+	serviceEdits  chan serviceUpdateRequest
+	serviceAdds   chan serviceAddRequest
 	subscribes    chan subscribeRequest
 	unsubscribes  chan unsubscribeRequest
 	hostMeta      chan hostMetaRequest
@@ -79,6 +105,8 @@ func New(ctx context.Context) *Store {
 		statusUpdates: make(chan statusRequest),
 		groupAdds:     make(chan groupRequest),
 		groupAssigns:  make(chan assignRequest),
+		serviceEdits:  make(chan serviceUpdateRequest),
+		serviceAdds:   make(chan serviceAddRequest),
 		subscribes:    make(chan subscribeRequest),
 		unsubscribes:  make(chan unsubscribeRequest),
 		hostMeta:      make(chan hostMetaRequest),
@@ -141,6 +169,58 @@ func (st *Store) AssignHostGroup(ctx context.Context, hostName, group string) er
 		return ctx.Err()
 	case st.groupAssigns <- assignRequest{hostName: hostName, group: group}:
 		return nil
+	}
+}
+
+// UpdateService edits a monitoring task without racing over the shared inventory.
+func (st *Store) UpdateService(ctx context.Context, hostName, serviceName, command, notes string, interval int, sshUser, sshKeyPath, sshCommand string) error {
+	response := make(chan error, 1)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case st.serviceEdits <- serviceUpdateRequest{
+		hostName:    hostName,
+		serviceName: serviceName,
+		command:     command,
+		notes:       notes,
+		interval:    interval,
+		sshUser:     sshUser,
+		sshKeyPath:  sshKeyPath,
+		sshCommand:  sshCommand,
+		response:    response,
+	}:
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-response:
+		return err
+	}
+}
+
+// AddService creates a new monitoring task and fails when host/service identity is invalid.
+func (st *Store) AddService(ctx context.Context, hostName, serviceName, command, notes string, interval int, sshUser, sshKeyPath, sshCommand string) error {
+	response := make(chan error, 1)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case st.serviceAdds <- serviceAddRequest{
+		hostName:    hostName,
+		serviceName: serviceName,
+		command:     command,
+		notes:       notes,
+		interval:    interval,
+		sshUser:     sshUser,
+		sshKeyPath:  sshKeyPath,
+		sshCommand:  sshCommand,
+		response:    response,
+	}:
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-response:
+		return err
 	}
 }
 
@@ -224,6 +304,30 @@ func (st *Store) run(ctx context.Context) {
 				inventory.Groups[assignment.group] = struct{}{}
 				host.Group = assignment.group
 			}
+			publishSnapshot(inventory, subscribers)
+		case update := <-st.serviceEdits:
+			host, ok := inventory.Hosts[update.hostName]
+			if !ok {
+				update.response <- fmt.Errorf("host %s not found", update.hostName)
+				continue
+			}
+			if err := applyServiceUpdate(host, update); err != nil {
+				update.response <- err
+				continue
+			}
+			update.response <- nil
+			publishSnapshot(inventory, subscribers)
+		case add := <-st.serviceAdds:
+			host, ok := inventory.Hosts[add.hostName]
+			if !ok {
+				add.response <- fmt.Errorf("host %s not found", add.hostName)
+				continue
+			}
+			if err := applyServiceAdd(host, add); err != nil {
+				add.response <- err
+				continue
+			}
+			add.response <- nil
 			publishSnapshot(inventory, subscribers)
 		case request := <-st.requests:
 			request.response <- inventory.Clone()
@@ -328,6 +432,45 @@ func applyCommand(inventory *model.Inventory, command nagiosimport.CommandDefini
 		return
 	}
 	inventory.Commands[command.Name] = command.Command
+}
+
+func applyServiceUpdate(host *model.Host, update serviceUpdateRequest) error {
+	// Edit must be strict so typos do not create unintended checks.
+	for index := range host.Services {
+		service := &host.Services[index]
+		if service.Name != update.serviceName {
+			continue
+		}
+		service.CheckCommand = strings.TrimSpace(update.command)
+		service.Notes = strings.TrimSpace(update.notes)
+		service.CheckIntervalMinutes = update.interval
+		service.SSHUser = strings.TrimSpace(update.sshUser)
+		service.SSHKeyPath = strings.TrimSpace(update.sshKeyPath)
+		service.SSHCommand = strings.TrimSpace(update.sshCommand)
+		return nil
+	}
+	return fmt.Errorf("service %s not found on host %s", update.serviceName, host.Name)
+}
+
+func applyServiceAdd(host *model.Host, add serviceAddRequest) error {
+	// Add path is separate from edit path to keep intent explicit and safe.
+	if strings.TrimSpace(add.serviceName) == "" {
+		return fmt.Errorf("service name is required")
+	}
+	if serviceExists(host.Services, add.serviceName) {
+		return fmt.Errorf("service %s already exists on host %s", add.serviceName, host.Name)
+	}
+	host.Services = append(host.Services, model.Service{
+		Name:                 strings.TrimSpace(add.serviceName),
+		HostName:             host.Name,
+		CheckCommand:         strings.TrimSpace(add.command),
+		Notes:                strings.TrimSpace(add.notes),
+		CheckIntervalMinutes: add.interval,
+		SSHUser:              strings.TrimSpace(add.sshUser),
+		SSHKeyPath:           strings.TrimSpace(add.sshKeyPath),
+		SSHCommand:           strings.TrimSpace(add.sshCommand),
+	})
+	return nil
 }
 
 func expandCommand(commands map[string]string, raw string) string {

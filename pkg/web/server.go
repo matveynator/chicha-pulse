@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,29 +9,24 @@ import (
 	"html/template"
 	"net"
 	"net/http"
+	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"chicha-pulse/pkg/auth"
 	"chicha-pulse/pkg/model"
 	"chicha-pulse/pkg/store"
 )
 
 // This package keeps the UI minimal so the single binary stays lightweight.
 
-// ---- Configuration ----
-
-type AuthConfig struct {
-	Username string
-	Password string
-}
-
 // ---- Server ----
 
 type Server struct {
 	store          *store.Store
-	auth           AuthConfig
+	authManager    *auth.Manager
 	template       *template.Template
 	alertsTemplate *template.Template
 	hostsTemplate  *template.Template
@@ -38,20 +34,34 @@ type Server struct {
 	allowIPs       []string
 }
 
+type contextKey string
+
+const userContextKey contextKey = "user"
+
+type permissions struct {
+	CanViewServers    bool
+	CanViewMonitoring bool
+	CanEditMonitoring bool
+	CanAdmin          bool
+}
+
 // NewServer prepares the HTTP handler so the caller can run it with a standard net/http server.
-func NewServer(st *store.Store, auth AuthConfig, pageTitle string, allowIPs []string) (*Server, error) {
+func NewServer(st *store.Store, authManager *auth.Manager, pageTitle string, allowIPs []string) (*Server, error) {
 	page := template.Must(template.New("index").Funcs(template.FuncMap{
 		"statusBadge": statusBadge,
+		"safeID":      safeID,
 	}).Parse(indexTemplate))
 	alerts := template.Must(template.New("alerts").Funcs(template.FuncMap{
 		"statusBadge": statusBadge,
+		"safeID":      safeID,
 	}).Parse(alertsTemplate))
 	hosts := template.Must(template.New("hosts").Funcs(template.FuncMap{
 		"statusBadge": statusBadge,
+		"safeID":      safeID,
 	}).Parse(hostsTemplate))
 	return &Server{
 		store:          st,
-		auth:           auth,
+		authManager:    authManager,
 		template:       page,
 		alertsTemplate: alerts,
 		hostsTemplate:  hosts,
@@ -69,26 +79,50 @@ func (srv *Server) Handler() http.Handler {
 	mux.HandleFunc("/events/hosts", srv.handleHostsEvents)
 	mux.HandleFunc("/groups", srv.handleAddGroup)
 	mux.HandleFunc("/assign", srv.handleAssignGroup)
-	return srv.basicAuth(mux)
+	mux.HandleFunc("/services/add", srv.handleServiceAdd)
+	mux.HandleFunc("/services/update", srv.handleServiceUpdate)
+	mux.HandleFunc("/services/test", srv.handleServiceTest)
+	mux.HandleFunc("/users", srv.handleUsers)
+	return srv.authenticated(mux)
 }
 
 // ---- Handlers ----
 
 func (srv *Server) handleIndex(writer http.ResponseWriter, request *http.Request) {
 	ctx := request.Context()
+	perms := srv.permissionsFromRequest(request)
+	if !perms.CanViewServers && !perms.CanViewMonitoring {
+		http.Error(writer, "forbidden", http.StatusForbidden)
+		return
+	}
 	snapshot, err := srv.store.Snapshot(ctx)
 	if err != nil {
 		http.Error(writer, "failed to load inventory", http.StatusInternalServerError)
 		return
 	}
 
-	view := buildView(snapshot, srv.pageTitle)
+	var users []userView
+	if perms.CanAdmin {
+		entries, err := srv.authManager.ListUsers(ctx)
+		if err != nil {
+			http.Error(writer, "failed to load users", http.StatusInternalServerError)
+			return
+		}
+		users = buildUserViews(entries)
+	}
+
+	view := buildView(snapshot, srv.pageTitle, perms, users)
 	if err := srv.template.Execute(writer, view); err != nil {
 		http.Error(writer, "failed to render", http.StatusInternalServerError)
 	}
 }
 
 func (srv *Server) handleStatsEvents(writer http.ResponseWriter, request *http.Request) {
+	perms := srv.permissionsFromRequest(request)
+	if !perms.CanViewMonitoring {
+		http.Error(writer, "forbidden", http.StatusForbidden)
+		return
+	}
 	flusher, ok := writer.(http.Flusher)
 	if !ok {
 		http.Error(writer, "streaming unsupported", http.StatusInternalServerError)
@@ -129,6 +163,11 @@ func (srv *Server) handleStatsEvents(writer http.ResponseWriter, request *http.R
 }
 
 func (srv *Server) handleAlertsEvents(writer http.ResponseWriter, request *http.Request) {
+	perms := srv.permissionsFromRequest(request)
+	if !perms.CanViewMonitoring {
+		http.Error(writer, "forbidden", http.StatusForbidden)
+		return
+	}
 	flusher, ok := writer.(http.Flusher)
 	if !ok {
 		http.Error(writer, "streaming unsupported", http.StatusInternalServerError)
@@ -172,6 +211,11 @@ func (srv *Server) handleAlertsEvents(writer http.ResponseWriter, request *http.
 }
 
 func (srv *Server) handleHostsEvents(writer http.ResponseWriter, request *http.Request) {
+	perms := srv.permissionsFromRequest(request)
+	if !perms.CanViewServers {
+		http.Error(writer, "forbidden", http.StatusForbidden)
+		return
+	}
 	flusher, ok := writer.(http.Flusher)
 	if !ok {
 		http.Error(writer, "streaming unsupported", http.StatusInternalServerError)
@@ -203,12 +247,12 @@ func (srv *Server) handleHostsEvents(writer http.ResponseWriter, request *http.R
 			parents, heads := buildParentHierarchy(snapshot)
 			var headViews []hostView
 			for _, host := range heads {
-				headViews = append(headViews, buildHostView(host, parents, snapshot))
+				headViews = append(headViews, buildHostView(host, parents, snapshot, perms))
 			}
 			sort.Slice(headViews, func(i, j int) bool {
 				return headViews[i].Name < headViews[j].Name
 			})
-			html, err := srv.renderHostsHTML(headViews, snapshot)
+			html, err := srv.renderHostsHTML(headViews, snapshot, perms)
 			if err != nil {
 				return
 			}
@@ -227,6 +271,10 @@ func (srv *Server) handleAddGroup(writer http.ResponseWriter, request *http.Requ
 		http.Redirect(writer, request, "/", http.StatusSeeOther)
 		return
 	}
+	if !srv.permissionsFromRequest(request).CanEditMonitoring {
+		http.Error(writer, "forbidden", http.StatusForbidden)
+		return
+	}
 	if err := request.ParseForm(); err != nil {
 		http.Error(writer, "invalid form", http.StatusBadRequest)
 		return
@@ -243,6 +291,10 @@ func (srv *Server) handleAssignGroup(writer http.ResponseWriter, request *http.R
 		http.Redirect(writer, request, "/", http.StatusSeeOther)
 		return
 	}
+	if !srv.permissionsFromRequest(request).CanEditMonitoring {
+		http.Error(writer, "forbidden", http.StatusForbidden)
+		return
+	}
 	if err := request.ParseForm(); err != nil {
 		http.Error(writer, "invalid form", http.StatusBadRequest)
 		return
@@ -255,19 +307,184 @@ func (srv *Server) handleAssignGroup(writer http.ResponseWriter, request *http.R
 	http.Redirect(writer, request, "/", http.StatusSeeOther)
 }
 
-func (srv *Server) basicAuth(next http.Handler) http.Handler {
+func (srv *Server) handleServiceUpdate(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		http.Redirect(writer, request, "/", http.StatusSeeOther)
+		return
+	}
+	if !srv.permissionsFromRequest(request).CanEditMonitoring {
+		http.Error(writer, "forbidden", http.StatusForbidden)
+		return
+	}
+	if err := request.ParseForm(); err != nil {
+		http.Error(writer, "invalid form", http.StatusBadRequest)
+		return
+	}
+	host := strings.TrimSpace(request.FormValue("host"))
+	service := strings.TrimSpace(request.FormValue("service"))
+	command := strings.TrimSpace(request.FormValue("command"))
+	notes := strings.TrimSpace(request.FormValue("notes"))
+	interval, _ := strconv.Atoi(strings.TrimSpace(request.FormValue("interval")))
+	sshUser := strings.TrimSpace(request.FormValue("ssh_user"))
+	sshKeyPath := strings.TrimSpace(request.FormValue("ssh_key_path"))
+	sshCommand := strings.TrimSpace(request.FormValue("ssh_command"))
+	if host == "" || service == "" {
+		http.Error(writer, "missing host or service", http.StatusBadRequest)
+		return
+	}
+	if err := srv.store.UpdateService(request.Context(), host, service, command, notes, interval, sshUser, sshKeyPath, sshCommand); err != nil {
+		http.Error(writer, err.Error(), http.StatusBadRequest)
+		return
+	}
+	http.Redirect(writer, request, "/", http.StatusSeeOther)
+}
+
+func (srv *Server) handleServiceAdd(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		http.Redirect(writer, request, "/", http.StatusSeeOther)
+		return
+	}
+	if !srv.permissionsFromRequest(request).CanEditMonitoring {
+		http.Error(writer, "forbidden", http.StatusForbidden)
+		return
+	}
+	if err := request.ParseForm(); err != nil {
+		http.Error(writer, "invalid form", http.StatusBadRequest)
+		return
+	}
+	host := strings.TrimSpace(request.FormValue("host"))
+	service := strings.TrimSpace(request.FormValue("service"))
+	command := strings.TrimSpace(request.FormValue("command"))
+	notes := strings.TrimSpace(request.FormValue("notes"))
+	interval, _ := strconv.Atoi(strings.TrimSpace(request.FormValue("interval")))
+	sshUser := strings.TrimSpace(request.FormValue("ssh_user"))
+	sshKeyPath := strings.TrimSpace(request.FormValue("ssh_key_path"))
+	sshCommand := strings.TrimSpace(request.FormValue("ssh_command"))
+	if host == "" || service == "" {
+		http.Error(writer, "missing host or service", http.StatusBadRequest)
+		return
+	}
+	if err := srv.store.AddService(request.Context(), host, service, command, notes, interval, sshUser, sshKeyPath, sshCommand); err != nil {
+		http.Error(writer, err.Error(), http.StatusBadRequest)
+		return
+	}
+	http.Redirect(writer, request, "/", http.StatusSeeOther)
+}
+
+func (srv *Server) handleServiceTest(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !srv.permissionsFromRequest(request).CanEditMonitoring {
+		http.Error(writer, "forbidden", http.StatusForbidden)
+		return
+	}
+	if err := request.ParseForm(); err != nil {
+		http.Error(writer, "invalid form", http.StatusBadRequest)
+		return
+	}
+	host := strings.TrimSpace(request.FormValue("host"))
+	service := strings.TrimSpace(request.FormValue("service"))
+	command := strings.TrimSpace(request.FormValue("command"))
+	if host == "" || service == "" || command == "" {
+		http.Error(writer, "missing host, service, or command", http.StatusBadRequest)
+		return
+	}
+	logOutput := runServiceTest(request.Context(), host, service, command)
+	writer.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(writer).Encode(map[string]string{"log": logOutput})
+}
+
+func runServiceTest(parent context.Context, hostName, serviceName, command string) string {
+	// Keep test runs bounded so the editor never hangs the UI for long-running checks.
+	ctx, cancel := context.WithTimeout(parent, 15*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "bash", "-lc", command)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	var logBuilder strings.Builder
+	logBuilder.WriteString("Test run for host=")
+	logBuilder.WriteString(hostName)
+	logBuilder.WriteString(" service=")
+	logBuilder.WriteString(serviceName)
+	logBuilder.WriteString("\n")
+	logBuilder.WriteString("Command: ")
+	logBuilder.WriteString(command)
+	logBuilder.WriteString("\n\n")
+	if stdout.Len() > 0 {
+		logBuilder.WriteString("STDOUT:\n")
+		logBuilder.WriteString(stdout.String())
+		if !strings.HasSuffix(stdout.String(), "\n") {
+			logBuilder.WriteString("\n")
+		}
+	}
+	if stderr.Len() > 0 {
+		logBuilder.WriteString("STDERR:\n")
+		logBuilder.WriteString(stderr.String())
+		if !strings.HasSuffix(stderr.String(), "\n") {
+			logBuilder.WriteString("\n")
+		}
+	}
+	if err != nil {
+		logBuilder.WriteString("Result: FAILED\n")
+		logBuilder.WriteString("Error: ")
+		logBuilder.WriteString(err.Error())
+		logBuilder.WriteString("\n")
+		return logBuilder.String()
+	}
+	logBuilder.WriteString("Result: SUCCESS\n")
+	return logBuilder.String()
+}
+
+func (srv *Server) handleUsers(writer http.ResponseWriter, request *http.Request) {
+	if !srv.permissionsFromRequest(request).CanAdmin {
+		http.Error(writer, "forbidden", http.StatusForbidden)
+		return
+	}
+	if request.Method != http.MethodPost {
+		http.Redirect(writer, request, "/", http.StatusSeeOther)
+		return
+	}
+	if err := request.ParseForm(); err != nil {
+		http.Error(writer, "invalid form", http.StatusBadRequest)
+		return
+	}
+	username := strings.TrimSpace(request.FormValue("username"))
+	password := strings.TrimSpace(request.FormValue("password"))
+	roles := parseRolesFromForm(request.Form)
+	if err := srv.authManager.CreateUser(request.Context(), username, password, roles); err != nil {
+		http.Error(writer, err.Error(), http.StatusBadRequest)
+		return
+	}
+	http.Redirect(writer, request, "/", http.StatusSeeOther)
+}
+
+func (srv *Server) authenticated(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if !srv.isAllowedIP(request) {
 			http.Error(writer, "forbidden", http.StatusForbidden)
 			return
 		}
-		user, pass, ok := request.BasicAuth()
-		if !ok || user != srv.auth.Username || pass != srv.auth.Password {
+		username, password, ok := request.BasicAuth()
+		if !ok {
 			writer.Header().Set("WWW-Authenticate", "Basic realm=\"chicha-pulse\"")
 			writer.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(writer, request)
+		user, ok := srv.authManager.Authenticate(request.Context(), username, password)
+		if !ok {
+			writer.Header().Set("WWW-Authenticate", "Basic realm=\"chicha-pulse\"")
+			writer.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		ctx := context.WithValue(request.Context(), userContextKey, user)
+		next.ServeHTTP(writer, request.WithContext(ctx))
 	})
 }
 
@@ -303,16 +520,74 @@ func (srv *Server) isAllowedIP(request *http.Request) bool {
 	return false
 }
 
+func (srv *Server) permissionsFromRequest(request *http.Request) permissions {
+	// Resolve permissions once so handlers can stay focused on their core work.
+	user, ok := request.Context().Value(userContextKey).(auth.User)
+	if !ok {
+		return permissions{}
+	}
+	canAdmin := auth.HasRole(user, auth.RoleAdmin)
+	return permissions{
+		CanViewServers:    canAdmin || auth.HasRole(user, auth.RoleServersView),
+		CanViewMonitoring: canAdmin || auth.HasRole(user, auth.RoleMonitoringView) || auth.HasRole(user, auth.RoleMonitoringEdit),
+		CanEditMonitoring: canAdmin || auth.HasRole(user, auth.RoleMonitoringEdit),
+		CanAdmin:          canAdmin,
+	}
+}
+
+func parseRolesFromForm(values map[string][]string) []auth.Role {
+	// Decode role checkboxes without relying on any external libraries.
+	var roles []auth.Role
+	for key := range values {
+		switch key {
+		case "role_admin":
+			roles = append(roles, auth.RoleAdmin)
+		case "role_servers_view":
+			roles = append(roles, auth.RoleServersView)
+		case "role_monitoring_view":
+			roles = append(roles, auth.RoleMonitoringView)
+		case "role_monitoring_edit":
+			roles = append(roles, auth.RoleMonitoringEdit)
+		}
+	}
+	return roles
+}
+
+func buildUserViews(users []auth.UserView) []userView {
+	// Format roles once so templates can stay simple.
+	views := make([]userView, 0, len(users))
+	for _, user := range users {
+		roleNames := make([]string, 0, len(user.Roles))
+		for _, role := range user.Roles {
+			roleNames = append(roleNames, string(role))
+		}
+		sort.Strings(roleNames)
+		views = append(views, userView{
+			Username: user.Username,
+			Roles:    strings.Join(roleNames, ", "),
+		})
+	}
+	sort.Slice(views, func(i, j int) bool {
+		return views[i].Username < views[j].Username
+	})
+	return views
+}
+
 // ---- View models ----
 
 type pageView struct {
-	Title         string
-	TotalServices int
-	Stats         statsView
-	Groups        []groupView
-	GroupNames    []string
-	Heads         []hostView
-	Alerts        []alertView
+	Title             string
+	TotalServices     int
+	Stats             statsView
+	Groups            []groupView
+	GroupNames        []string
+	Heads             []hostView
+	Alerts            []alertView
+	Users             []userView
+	CanViewServers    bool
+	CanViewMonitoring bool
+	CanEditMonitoring bool
+	CanAdmin          bool
 }
 
 type groupView struct {
@@ -341,11 +616,14 @@ type hostView struct {
 
 type serviceView struct {
 	Name        string
+	HostName    string
 	Command     string
+	RawCommand  string
 	Notes       string
 	Interval    int
 	SSHUser     string
 	SSHKeyPath  string
+	SSHCommand  string
 	StatusLabel string
 	StatusClass string
 	CheckedAt   string
@@ -359,6 +637,11 @@ type alertView struct {
 	StatusClass string
 	Output      string
 	CheckedAt   string
+}
+
+type userView struct {
+	Username string
+	Roles    string
 }
 
 type statsView struct {
@@ -390,8 +673,10 @@ type alertsPayload struct {
 }
 
 type hostsPayload struct {
-	Heads      []hostView
-	GroupNames []string
+	Heads             []hostView
+	GroupNames        []string
+	CanViewMonitoring bool
+	CanEditMonitoring bool
 }
 
 // ---- Template rendering ----
@@ -406,10 +691,10 @@ func (srv *Server) renderAlertsHTML(alerts []alertView) (string, error) {
 	return buffer.String(), nil
 }
 
-func (srv *Server) renderHostsHTML(heads []hostView, inventory model.Inventory) (string, error) {
+func (srv *Server) renderHostsHTML(heads []hostView, inventory model.Inventory, perms permissions) (string, error) {
 	// Render host hierarchy as a partial so the UI can swap it in-place.
 	var buffer strings.Builder
-	payload := buildHostsPayload(heads, inventory)
+	payload := buildHostsPayload(heads, inventory, perms)
 	if err := srv.hostsTemplate.Execute(&buffer, payload); err != nil {
 		return "", err
 	}
@@ -418,27 +703,44 @@ func (srv *Server) renderHostsHTML(heads []hostView, inventory model.Inventory) 
 
 // ---- View helpers ----
 
-func buildView(inventory model.Inventory, title string) pageView {
-	parents, heads := buildParentHierarchy(inventory)
-
+func buildView(inventory model.Inventory, title string, perms permissions, users []userView) pageView {
 	var headViews []hostView
-	for _, host := range heads {
-		headViews = append(headViews, buildHostView(host, parents, inventory))
-	}
-	sort.Slice(headViews, func(i, j int) bool {
-		return headViews[i].Name < headViews[j].Name
-	})
+	var groupViews []groupView
+	var groupNames []string
+	var alerts []alertView
+	stats := statsView{}
+	totalServices := 0
 
-	groups, groupNames := buildGroups(inventory)
-	alerts := buildAlerts(inventory)
+	if perms.CanViewServers {
+		parents, heads := buildParentHierarchy(inventory)
+		for _, host := range heads {
+			headViews = append(headViews, buildHostView(host, parents, inventory, perms))
+		}
+		sort.Slice(headViews, func(i, j int) bool {
+			return headViews[i].Name < headViews[j].Name
+		})
+		groupViews, groupNames = buildGroups(inventory, perms)
+	}
+
+	if perms.CanViewMonitoring {
+		alerts = buildAlerts(inventory)
+		stats = buildStats(inventory)
+		totalServices = countServices(inventory)
+	}
+
 	return pageView{
-		Title:         title,
-		TotalServices: countServices(inventory),
-		Stats:         buildStats(inventory),
-		Groups:        groups,
-		GroupNames:    groupNames,
-		Heads:         headViews,
-		Alerts:        alerts,
+		Title:             title,
+		TotalServices:     totalServices,
+		Stats:             stats,
+		Groups:            groupViews,
+		GroupNames:        groupNames,
+		Heads:             headViews,
+		Alerts:            alerts,
+		Users:             users,
+		CanViewServers:    perms.CanViewServers,
+		CanViewMonitoring: perms.CanViewMonitoring,
+		CanEditMonitoring: perms.CanEditMonitoring,
+		CanAdmin:          perms.CanAdmin,
 	}
 }
 
@@ -447,12 +749,14 @@ func buildAlertsPayload(alerts []alertView) alertsPayload {
 	return alertsPayload{Alerts: alerts}
 }
 
-func buildHostsPayload(heads []hostView, inventory model.Inventory) hostsPayload {
+func buildHostsPayload(heads []hostView, inventory model.Inventory, perms permissions) hostsPayload {
 	// Include group names so the host assignment dropdown stays current.
-	_, groupNames := buildGroups(inventory)
+	_, groupNames := buildGroups(inventory, perms)
 	return hostsPayload{
-		Heads:      heads,
-		GroupNames: groupNames,
+		Heads:             heads,
+		GroupNames:        groupNames,
+		CanViewMonitoring: perms.CanViewMonitoring,
+		CanEditMonitoring: perms.CanEditMonitoring,
 	}
 }
 
@@ -483,7 +787,7 @@ func resolveHostParents(host *model.Host) []string {
 	return append([]string(nil), host.Parents...)
 }
 
-func buildGroups(inventory model.Inventory) ([]groupView, []string) {
+func buildGroups(inventory model.Inventory, perms permissions) ([]groupView, []string) {
 	var names []string
 	for name := range inventory.Groups {
 		names = append(names, name)
@@ -498,6 +802,9 @@ func buildGroups(inventory model.Inventory) ([]groupView, []string) {
 				continue
 			}
 			label, class := hostStatus(host, inventory)
+			if !perms.CanViewMonitoring {
+				label, class = "RESTRICTED", "status-unknown"
+			}
 			hosts = append(hosts, hostSummary{Name: host.Name, StatusLabel: label, StatusClass: class})
 		}
 		sort.Slice(hosts, func(i, j int) bool {
@@ -539,32 +846,38 @@ func buildAlerts(inventory model.Inventory) []alertView {
 	return alerts
 }
 
-func buildHostView(host *model.Host, parents map[string][]*model.Host, inventory model.Inventory) hostView {
-	services := make([]serviceView, 0, len(host.Services))
-	for _, service := range host.Services {
-		key := host.Name + "/" + service.Name
-		status, ok := inventory.Statuses[key]
-		label, class := statusLabelFromStatus(status, ok)
-		services = append(services, serviceView{
-			Name:        service.Name,
-			Command:     displayServiceCommand(host, service),
-			Notes:       service.Notes,
-			Interval:    service.CheckIntervalMinutes,
-			SSHUser:     service.SSHUser,
-			SSHKeyPath:  service.SSHKeyPath,
-			StatusLabel: label,
-			StatusClass: class,
-			CheckedAt:   formatTime(status.CheckedAt),
-			Output:      status.Output,
+func buildHostView(host *model.Host, parents map[string][]*model.Host, inventory model.Inventory, perms permissions) hostView {
+	var services []serviceView
+	if perms.CanViewMonitoring {
+		services = make([]serviceView, 0, len(host.Services))
+		for _, service := range host.Services {
+			key := host.Name + "/" + service.Name
+			status, ok := inventory.Statuses[key]
+			label, class := statusLabelFromStatus(status, ok)
+			services = append(services, serviceView{
+				Name:        service.Name,
+				HostName:    host.Name,
+				Command:     displayServiceCommand(host, service),
+				RawCommand:  service.CheckCommand,
+				Notes:       service.Notes,
+				Interval:    service.CheckIntervalMinutes,
+				SSHUser:     service.SSHUser,
+				SSHKeyPath:  service.SSHKeyPath,
+				SSHCommand:  service.SSHCommand,
+				StatusLabel: label,
+				StatusClass: class,
+				CheckedAt:   formatTime(status.CheckedAt),
+				Output:      status.Output,
+			})
+		}
+		sort.Slice(services, func(i, j int) bool {
+			return services[i].Name < services[j].Name
 		})
 	}
-	sort.Slice(services, func(i, j int) bool {
-		return services[i].Name < services[j].Name
-	})
 
 	var guests []hostView
 	for _, child := range parents[host.Name] {
-		guests = append(guests, buildHostView(child, parents, inventory))
+		guests = append(guests, buildHostView(child, parents, inventory, perms))
 	}
 	if len(guests) > 0 {
 		sort.Slice(guests, func(i, j int) bool {
@@ -573,6 +886,10 @@ func buildHostView(host *model.Host, parents map[string][]*model.Host, inventory
 	}
 
 	label, class := hostStatus(host, inventory)
+	if !perms.CanViewMonitoring {
+		// Hide live health signals from users who are not allowed to inspect monitoring state.
+		label, class = "RESTRICTED", "status-unknown"
+	}
 
 	return hostView{
 		Name:        host.Name,
@@ -855,57 +1172,112 @@ const indexTemplate = `<!doctype html>
     .stats-item { min-width: 10rem; }
     .live-indicator { font-weight: bold; color: #2c3e50; }
     .trend { font-weight: bold; margin-left: 0.5rem; }
+    .service-actions { margin-left: 0.5rem; display: inline-flex; gap: 0.4rem; }
+    .editor-panel { margin-top: 0.5rem; padding: 0.6rem; border: 1px solid #ddd; border-radius: 6px; background: #fafafa; }
+    .editor-panel[hidden] { display: none; }
+    .log-output { margin-top: 0.5rem; white-space: pre-wrap; background: #111; color: #eee; padding: 0.6rem; border-radius: 6px; font-family: monospace; }
   </style>
 </head>
 <body>
   <h1>{{.Title}}</h1>
 
-  <div class="card">
-    <h2>Live task stats</h2>
-    <div class="stats-row">
-      <div class="stats-item"><strong>Total services:</strong> <span id="stat-total">{{.Stats.Total}}</span></div>
-      <div class="stats-item"><strong>Errors:</strong> <span id="stat-errors">{{.Stats.Errors}}</span><span id="stat-error-trend" class="trend"></span></div>
-      <div class="stats-item">Warning: <span id="stat-warning">{{.Stats.Warning}}</span></div>
-      <div class="stats-item">Critical: <span id="stat-critical">{{.Stats.Critical}}</span></div>
-      <div class="stats-item">Unknown: <span id="stat-unknown">{{.Stats.Unknown}}</span></div>
-      <div class="stats-item">Planned soon: <span id="stat-planned">{{.Stats.Planned}}</span></div>
-      <div class="stats-item">Running now: <span id="stat-running">{{.Stats.Running}}</span></div>
-      <div class="stats-item">Overall: <span id="stat-overall" class="badge {{statusBadge .Stats.OverallClass}}">{{.Stats.OverallLabel}}</span></div>
+  {{if .CanViewMonitoring}}
+    <div class="card">
+      <h2>Live task stats</h2>
+      <div class="stats-row">
+        <div class="stats-item"><strong>Total services:</strong> <span id="stat-total">{{.Stats.Total}}</span></div>
+        <div class="stats-item"><strong>Errors:</strong> <span id="stat-errors">{{.Stats.Errors}}</span><span id="stat-error-trend" class="trend"></span></div>
+        <div class="stats-item">Warning: <span id="stat-warning">{{.Stats.Warning}}</span></div>
+        <div class="stats-item">Critical: <span id="stat-critical">{{.Stats.Critical}}</span></div>
+        <div class="stats-item">Unknown: <span id="stat-unknown">{{.Stats.Unknown}}</span></div>
+        <div class="stats-item">Planned soon: <span id="stat-planned">{{.Stats.Planned}}</span></div>
+        <div class="stats-item">Running now: <span id="stat-running">{{.Stats.Running}}</span></div>
+        <div class="stats-item">Overall: <span id="stat-overall" class="badge {{statusBadge .Stats.OverallClass}}">{{.Stats.OverallLabel}}</span></div>
+      </div>
+      <div class="meta live-indicator" id="stat-connection">Live updates connected.</div>
     </div>
-    <div class="meta live-indicator" id="stat-connection">Live updates connected.</div>
-  </div>
+  {{end}}
 
-  <div class="card">
-    <h2>Groups</h2>
-    <form method="post" action="/groups">
-      <input type="text" name="group" placeholder="New group" />
-      <button type="submit">Add group</button>
-    </form>
-    {{if .Groups}}
-      {{range .Groups}}
-        <h3>{{.Name}}</h3>
-        {{if .Hosts}}
-          <ul>
-            {{range .Hosts}}
-              <li><span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span> {{.Name}}</li>
-            {{end}}
-          </ul>
-        {{else}}
-          <div class="meta">No hosts assigned yet.</div>
-        {{end}}
+  {{if .CanViewServers}}
+    <div class="card">
+      <h2>Groups</h2>
+      {{if .CanEditMonitoring}}
+        <form method="post" action="/groups">
+          <input type="text" name="group" placeholder="New group" />
+          <button type="submit">Add group</button>
+        </form>
+      {{else}}
+        <div class="meta">Editing buttons are hidden because monitoring:edit role is not assigned.</div>
       {{end}}
-    {{else}}
-      <div class="meta">No groups yet.</div>
-    {{end}}
-  </div>
+      {{if .Groups}}
+        {{range .Groups}}
+          <h3>{{.Name}}</h3>
+          {{if .Hosts}}
+            <ul>
+              {{range .Hosts}}
+                <li>{{if $.CanViewMonitoring}}<span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span> {{end}}{{.Name}}</li>
+              {{end}}
+            </ul>
+          {{else}}
+            <div class="meta">No hosts assigned yet.</div>
+          {{end}}
+        {{end}}
+      {{else}}
+        <div class="meta">No groups yet.</div>
+      {{end}}
+    </div>
+  {{end}}
 
-  <div id="alerts-card">
-    {{template "alertsCard" .}}
-  </div>
+  {{if .CanViewMonitoring}}
+    <div id="alerts-card">
+      {{template "alertsCard" .}}
+    </div>
+  {{end}}
 
-  <div id="hosts-tree">
-    {{template "hostsTree" .}}
-  </div>
+  {{if .CanViewServers}}
+    <div id="hosts-tree">
+      {{template "hostsTree" .}}
+    </div>
+  {{else}}
+    <div class="card">
+      <h2>Servers</h2>
+      <div class="meta">No server view permission assigned.</div>
+    </div>
+  {{end}}
+  {{if .CanAdmin}}
+    <div class="card">
+      <h2>User access</h2>
+      <form method="post" action="/users">
+        <input type="text" name="username" placeholder="Username" />
+        <input type="password" name="password" placeholder="Password" />
+        <div class="meta">Roles:</div>
+        <label><input type="checkbox" name="role_admin" /> admin</label>
+        <label><input type="checkbox" name="role_servers_view" /> servers:view</label>
+        <label><input type="checkbox" name="role_monitoring_view" /> monitoring:view</label>
+        <label><input type="checkbox" name="role_monitoring_edit" /> monitoring:edit</label>
+        <button type="submit">Add user</button>
+      </form>
+      {{if .Users}}
+        <table>
+          <thead>
+            <tr><th>User</th><th>Roles</th></tr>
+          </thead>
+          <tbody>
+            {{range .Users}}
+              <tr><td>{{.Username}}</td><td>{{.Roles}}</td></tr>
+            {{end}}
+          </tbody>
+        </table>
+      {{else}}
+        <div class="meta">No users found.</div>
+      {{end}}
+    </div>
+  {{else}}
+    <div class="card">
+      <h2>User access</h2>
+      <div class="meta">User management buttons are visible only for admin role.</div>
+    </div>
+  {{end}}
   <script>
     (function () {
       // Use SSE to update the stats card without reloading the page.
@@ -919,10 +1291,12 @@ const indexTemplate = `<!doctype html>
       var overallEl = document.getElementById("stat-overall");
       var connectionEl = document.getElementById("stat-connection");
       var trendEl = document.getElementById("stat-error-trend");
-      var lastErrors = Number(errorEl.textContent) || 0;
+      var lastErrors = errorEl ? Number(errorEl.textContent) || 0 : 0;
 
       if (!window.EventSource) {
-        connectionEl.textContent = "Live updates unavailable (EventSource not supported).";
+        if (connectionEl) {
+          connectionEl.textContent = "Live updates unavailable (EventSource not supported).";
+        }
         return;
       }
 
@@ -939,56 +1313,109 @@ const indexTemplate = `<!doctype html>
         return "badge-unknown";
       }
 
-      var source = new EventSource("/events/stats");
-      source.onmessage = function (event) {
-        try {
-          var payload = JSON.parse(event.data);
-          totalEl.textContent = payload.total_services;
-          errorEl.textContent = payload.error_count;
-          warningEl.textContent = payload.warning_count;
-          criticalEl.textContent = payload.critical_count;
-          unknownEl.textContent = payload.unknown_count;
-          plannedEl.textContent = payload.planned_count;
-          runningEl.textContent = payload.running_count;
-          overallEl.textContent = payload.overall_label;
-          overallEl.className = "badge " + statusBadge(payload.overall_class);
-          var delta = payload.error_count - lastErrors;
-          if (delta > 0) {
-            trendEl.textContent = "↑ " + delta;
-          } else if (delta < 0) {
-            trendEl.textContent = "↓ " + Math.abs(delta);
-          } else {
-            trendEl.textContent = "";
+      if (totalEl) {
+        var source = new EventSource("/events/stats");
+        source.onmessage = function (event) {
+          try {
+            var payload = JSON.parse(event.data);
+            totalEl.textContent = payload.total_services;
+            errorEl.textContent = payload.error_count;
+            warningEl.textContent = payload.warning_count;
+            criticalEl.textContent = payload.critical_count;
+            unknownEl.textContent = payload.unknown_count;
+            plannedEl.textContent = payload.planned_count;
+            runningEl.textContent = payload.running_count;
+            overallEl.textContent = payload.overall_label;
+            overallEl.className = "badge " + statusBadge(payload.overall_class);
+            var delta = payload.error_count - lastErrors;
+            if (delta > 0) {
+              trendEl.textContent = "↑ " + delta;
+            } else if (delta < 0) {
+              trendEl.textContent = "↓ " + Math.abs(delta);
+            } else {
+              trendEl.textContent = "";
+            }
+            lastErrors = payload.error_count;
+            connectionEl.textContent = "Live updates connected.";
+          } catch (err) {
+            connectionEl.textContent = "Live updates received malformed data.";
           }
-          lastErrors = payload.error_count;
-          connectionEl.textContent = "Live updates connected.";
-        } catch (err) {
-          connectionEl.textContent = "Live updates received malformed data.";
-        }
-      };
-      source.onerror = function () {
-        connectionEl.textContent = "Live updates disconnected; retrying.";
-      };
+        };
+        source.onerror = function () {
+          connectionEl.textContent = "Live updates disconnected; retrying.";
+        };
+      }
 
-      var alertsSource = new EventSource("/events/alerts");
-      alertsSource.onmessage = function (event) {
-        try {
-          var payload = JSON.parse(event.data);
-          document.getElementById("alerts-card").innerHTML = payload.html;
-        } catch (err) {
-          connectionEl.textContent = "Live updates received malformed data.";
-        }
-      };
+      var alertsCard = document.getElementById("alerts-card");
+      if (alertsCard) {
+        var alertsSource = new EventSource("/events/alerts");
+        alertsSource.onmessage = function (event) {
+          try {
+            var payload = JSON.parse(event.data);
+            alertsCard.innerHTML = payload.html;
+          } catch (err) {
+            if (connectionEl) {
+              connectionEl.textContent = "Live updates received malformed data.";
+            }
+          }
+        };
+      }
 
-      var hostsSource = new EventSource("/events/hosts");
-      hostsSource.onmessage = function (event) {
-        try {
-          var payload = JSON.parse(event.data);
-          document.getElementById("hosts-tree").innerHTML = payload.html;
-        } catch (err) {
-          connectionEl.textContent = "Live updates received malformed data.";
-        }
-      };
+      var hostsTree = document.getElementById("hosts-tree");
+      if (hostsTree) {
+        var hostsSource = new EventSource("/events/hosts");
+        hostsSource.onmessage = function (event) {
+          try {
+            var payload = JSON.parse(event.data);
+            hostsTree.innerHTML = payload.html;
+          } catch (err) {
+            if (connectionEl) {
+              connectionEl.textContent = "Live updates received malformed data.";
+            }
+          }
+        };
+
+
+      // Keep editor toggles client-side so server templates stay static and light.
+      document.querySelectorAll("[data-edit-toggle]").forEach(function (button) {
+        button.addEventListener("click", function () {
+          var targetId = button.getAttribute("data-edit-toggle");
+          var panel = document.getElementById(targetId);
+          if (!panel) {
+            return;
+          }
+          panel.hidden = !panel.hidden;
+        });
+      });
+
+      // Test-run button executes a backend endpoint and shows captured logs in-place.
+      document.querySelectorAll("[data-test-run]").forEach(function (button) {
+        button.addEventListener("click", function () {
+          var targetId = button.getAttribute("data-log-target");
+          var panel = document.getElementById(targetId);
+          var form = button.closest("form");
+          if (!panel || !form) {
+            return;
+          }
+          panel.textContent = "Running test...";
+          var data = new FormData(form);
+          fetch("/services/test", { method: "POST", body: data })
+            .then(function (response) {
+              if (!response.ok) {
+                return response.text().then(function (text) {
+                  throw new Error(text || "test run failed");
+                });
+              }
+              return response.json();
+            })
+            .then(function (payload) {
+              panel.textContent = payload.log || "No output.";
+            })
+            .catch(function (err) {
+              panel.textContent = "Test run error: " + err.message;
+            });
+        });
+      });
     })();
   </script>
 </body>
@@ -1024,10 +1451,11 @@ const indexTemplate = `<!doctype html>
 {{define "hostsTree"}}
   {{range .Heads}}
     <div class="host {{.StatusClass}}">
-      <h2>{{.Name}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></h2>
+      <h2>{{.Name}}{{if $.CanViewMonitoring}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span>{{end}}</h2>
       {{if .Address}}<div class="meta">Address: {{.Address}}</div>{{end}}
       {{if .OSName}}<div class="meta">OS: {{.OSLogo}} {{.OSName}} {{.OSVersion}}</div>{{end}}
-      {{if $.GroupNames}}
+      {{if .Group}}<div class="meta">Group: {{.Group}}</div>{{end}}
+      {{if and $.GroupNames $.CanEditMonitoring}}
         {{ $current := .Group }}
         <form class="inline" method="post" action="/assign">
           <input type="hidden" name="host" value="{{.Name}}" />
@@ -1047,7 +1475,7 @@ const indexTemplate = `<!doctype html>
   {{end}}
 {{end}}
 {{define "services"}}
-  {{if .Services}}
+  {{if $.CanViewMonitoring}}
     <h3>Services</h3>
     <ul class="services">
       {{range .Services}}
@@ -1059,10 +1487,46 @@ const indexTemplate = `<!doctype html>
           {{if .Interval}}<span class="meta"> every {{.Interval}}m</span>{{end}}
           {{if .SSHUser}}<span class="meta"> ssh {{.SSHUser}}</span>{{end}}
           {{if .SSHKeyPath}}<span class="meta"> key {{.SSHKeyPath}}</span>{{end}}
+          {{if .SSHCommand}}<span class="meta"> cmd {{.SSHCommand}}</span>{{end}}
           {{if .CheckedAt}}<div class="meta">Checked: {{.CheckedAt}} — {{.Output}}</div>{{end}}
+          {{if $.CanEditMonitoring}}
+            {{ $editorID := printf "editor-%s-%s" (safeID .HostName) (safeID .Name) }}
+            {{ $logID := printf "log-%s-%s" (safeID .HostName) (safeID .Name) }}
+            <span class="service-actions">
+              <button type="button" data-edit-toggle="{{$editorID}}">Edit task</button>
+            </span>
+            <form id="{{$editorID}}" class="editor-panel" method="post" action="/services/update" hidden>
+              <input type="hidden" name="host" value="{{.HostName}}" />
+              <input type="hidden" name="service" value="{{.Name}}" />
+              <div class="meta"><strong>Service task editor</strong></div>
+              <div><input type="text" name="command" value="{{.RawCommand}}" placeholder="Check command" /></div>
+              <div><input type="text" name="notes" value="{{.Notes}}" placeholder="Notes" /></div>
+              <div><input type="number" name="interval" value="{{.Interval}}" placeholder="Interval minutes" /></div>
+              <div><input type="text" name="ssh_user" value="{{.SSHUser}}" placeholder="SSH user" /></div>
+              <div><input type="text" name="ssh_key_path" value="{{.SSHKeyPath}}" placeholder="SSH key path" /></div>
+              <div><input type="text" name="ssh_command" value="{{.SSHCommand}}" placeholder="SSH command" /></div>
+              <button type="submit">Save</button>
+              <button type="button" data-test-run data-log-target="{{$logID}}">Test run</button>
+              <div id="{{$logID}}" class="log-output"></div>
+            </form>
+          {{end}}
         </li>
       {{end}}
     </ul>
+    {{if $.CanEditMonitoring}}
+      <form method="post" action="/services/add">
+        <input type="hidden" name="host" value="{{.Name}}" />
+        <div class="meta"><strong>Add monitoring task</strong></div>
+        <div><input type="text" name="service" placeholder="Service name" /></div>
+        <div><input type="text" name="command" placeholder="Check command" /></div>
+        <div><input type="text" name="notes" placeholder="Notes" /></div>
+        <div><input type="number" name="interval" placeholder="Interval minutes" /></div>
+        <div><input type="text" name="ssh_user" placeholder="SSH user" /></div>
+        <div><input type="text" name="ssh_key_path" placeholder="SSH key path" /></div>
+        <div><input type="text" name="ssh_command" placeholder="SSH command" /></div>
+        <button type="submit">Add monitoring task</button>
+      </form>
+    {{end}}
   {{end}}
 {{end}}
 {{define "guests"}}
@@ -1070,7 +1534,7 @@ const indexTemplate = `<!doctype html>
     <h3>Virtual machines</h3>
     {{range .Guests}}
       <div class="guest {{.StatusClass}}">
-        <h4>{{.Name}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></h4>
+        <h4>{{.Name}}{{if $.CanViewMonitoring}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span>{{end}}</h4>
         {{if .Address}}<div class="meta">Address: {{.Address}}</div>{{end}}
         {{if .OSName}}<div class="meta">OS: {{.OSLogo}} {{.OSName}} {{.OSVersion}}</div>{{end}}
         {{template "services" .}}
@@ -1110,10 +1574,11 @@ const alertsTemplate = `{{if .Alerts}}
 
 const hostsTemplate = `{{range .Heads}}
   <div class="host {{.StatusClass}}">
-    <h2>{{.Name}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></h2>
+    <h2>{{.Name}}{{if $.CanViewMonitoring}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span>{{end}}</h2>
     {{if .Address}}<div class="meta">Address: {{.Address}}</div>{{end}}
     {{if .OSName}}<div class="meta">OS: {{.OSLogo}} {{.OSName}} {{.OSVersion}}</div>{{end}}
-    {{if $.GroupNames}}
+    {{if .Group}}<div class="meta">Group: {{.Group}}</div>{{end}}
+    {{if and $.GroupNames $.CanEditMonitoring}}
       {{ $current := .Group }}
       <form class="inline" method="post" action="/assign">
         <input type="hidden" name="host" value="{{.Name}}" />
@@ -1132,7 +1597,7 @@ const hostsTemplate = `{{range .Heads}}
   <p>No hosts imported yet.</p>
 {{end}}
 {{define "services"}}
-  {{if .Services}}
+  {{if $.CanViewMonitoring}}
     <h3>Services</h3>
     <ul class="services">
       {{range .Services}}
@@ -1144,10 +1609,46 @@ const hostsTemplate = `{{range .Heads}}
           {{if .Interval}}<span class="meta"> every {{.Interval}}m</span>{{end}}
           {{if .SSHUser}}<span class="meta"> ssh {{.SSHUser}}</span>{{end}}
           {{if .SSHKeyPath}}<span class="meta"> key {{.SSHKeyPath}}</span>{{end}}
+          {{if .SSHCommand}}<span class="meta"> cmd {{.SSHCommand}}</span>{{end}}
           {{if .CheckedAt}}<div class="meta">Checked: {{.CheckedAt}} — {{.Output}}</div>{{end}}
+          {{if $.CanEditMonitoring}}
+            {{ $editorID := printf "editor-%s-%s" (safeID .HostName) (safeID .Name) }}
+            {{ $logID := printf "log-%s-%s" (safeID .HostName) (safeID .Name) }}
+            <span class="service-actions">
+              <button type="button" data-edit-toggle="{{$editorID}}">Edit task</button>
+            </span>
+            <form id="{{$editorID}}" class="editor-panel" method="post" action="/services/update" hidden>
+              <input type="hidden" name="host" value="{{.HostName}}" />
+              <input type="hidden" name="service" value="{{.Name}}" />
+              <div class="meta"><strong>Service task editor</strong></div>
+              <div><input type="text" name="command" value="{{.RawCommand}}" placeholder="Check command" /></div>
+              <div><input type="text" name="notes" value="{{.Notes}}" placeholder="Notes" /></div>
+              <div><input type="number" name="interval" value="{{.Interval}}" placeholder="Interval minutes" /></div>
+              <div><input type="text" name="ssh_user" value="{{.SSHUser}}" placeholder="SSH user" /></div>
+              <div><input type="text" name="ssh_key_path" value="{{.SSHKeyPath}}" placeholder="SSH key path" /></div>
+              <div><input type="text" name="ssh_command" value="{{.SSHCommand}}" placeholder="SSH command" /></div>
+              <button type="submit">Save</button>
+              <button type="button" data-test-run data-log-target="{{$logID}}">Test run</button>
+              <div id="{{$logID}}" class="log-output"></div>
+            </form>
+          {{end}}
         </li>
       {{end}}
     </ul>
+    {{if $.CanEditMonitoring}}
+      <form method="post" action="/services/add">
+        <input type="hidden" name="host" value="{{.Name}}" />
+        <div class="meta"><strong>Add monitoring task</strong></div>
+        <div><input type="text" name="service" placeholder="Service name" /></div>
+        <div><input type="text" name="command" placeholder="Check command" /></div>
+        <div><input type="text" name="notes" placeholder="Notes" /></div>
+        <div><input type="number" name="interval" placeholder="Interval minutes" /></div>
+        <div><input type="text" name="ssh_user" placeholder="SSH user" /></div>
+        <div><input type="text" name="ssh_key_path" placeholder="SSH key path" /></div>
+        <div><input type="text" name="ssh_command" placeholder="SSH command" /></div>
+        <button type="submit">Add monitoring task</button>
+      </form>
+    {{end}}
   {{end}}
 {{end}}
 {{define "guests"}}
@@ -1155,7 +1656,7 @@ const hostsTemplate = `{{range .Heads}}
     <h3>Virtual machines</h3>
     {{range .Guests}}
       <div class="guest {{.StatusClass}}">
-        <h4>{{.Name}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span></h4>
+        <h4>{{.Name}}{{if $.CanViewMonitoring}} <span class="badge {{statusBadge .StatusClass}}">{{.StatusLabel}}</span>{{end}}</h4>
         {{if .Address}}<div class="meta">Address: {{.Address}}</div>{{end}}
         {{if .OSName}}<div class="meta">OS: {{.OSLogo}} {{.OSName}} {{.OSVersion}}</div>{{end}}
         {{template "services" .}}
@@ -1178,6 +1679,28 @@ func statusBadge(class string) string {
 	default:
 		return "badge-unknown"
 	}
+}
+
+func safeID(value string) string {
+	// Normalize dynamic ids so host/service names cannot break HTML selectors.
+	if strings.TrimSpace(value) == "" {
+		return "item"
+	}
+	var builder strings.Builder
+	for _, char := range value {
+		isLetter := char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z'
+		isNumber := char >= '0' && char <= '9'
+		if isLetter || isNumber || char == '-' || char == '_' {
+			builder.WriteRune(char)
+			continue
+		}
+		builder.WriteByte('-')
+	}
+	clean := strings.Trim(builder.String(), "-")
+	if clean == "" {
+		return "item"
+	}
+	return clean
 }
 
 // ---- Lifecycle ----

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"html/template"
 	"net"
 	"net/http"
+	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,12 +49,15 @@ type permissions struct {
 func NewServer(st *store.Store, authManager *auth.Manager, pageTitle string, allowIPs []string) (*Server, error) {
 	page := template.Must(template.New("index").Funcs(template.FuncMap{
 		"statusBadge": statusBadge,
+		"safeID":      safeID,
 	}).Parse(indexTemplate))
 	alerts := template.Must(template.New("alerts").Funcs(template.FuncMap{
 		"statusBadge": statusBadge,
+		"safeID":      safeID,
 	}).Parse(alertsTemplate))
 	hosts := template.Must(template.New("hosts").Funcs(template.FuncMap{
 		"statusBadge": statusBadge,
+		"safeID":      safeID,
 	}).Parse(hostsTemplate))
 	return &Server{
 		store:          st,
@@ -75,6 +80,7 @@ func (srv *Server) Handler() http.Handler {
 	mux.HandleFunc("/groups", srv.handleAddGroup)
 	mux.HandleFunc("/assign", srv.handleAssignGroup)
 	mux.HandleFunc("/services/update", srv.handleServiceUpdate)
+	mux.HandleFunc("/services/test", srv.handleServiceTest)
 	mux.HandleFunc("/users", srv.handleUsers)
 	return srv.authenticated(mux)
 }
@@ -327,6 +333,77 @@ func (srv *Server) handleServiceUpdate(writer http.ResponseWriter, request *http
 	}
 	_ = srv.store.UpdateService(request.Context(), host, service, command, notes, interval, sshUser, sshKeyPath, sshCommand)
 	http.Redirect(writer, request, "/", http.StatusSeeOther)
+}
+
+func (srv *Server) handleServiceTest(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !srv.permissionsFromRequest(request).CanEditMonitoring {
+		http.Error(writer, "forbidden", http.StatusForbidden)
+		return
+	}
+	if err := request.ParseForm(); err != nil {
+		http.Error(writer, "invalid form", http.StatusBadRequest)
+		return
+	}
+	host := strings.TrimSpace(request.FormValue("host"))
+	service := strings.TrimSpace(request.FormValue("service"))
+	command := strings.TrimSpace(request.FormValue("command"))
+	if host == "" || service == "" || command == "" {
+		http.Error(writer, "missing host, service, or command", http.StatusBadRequest)
+		return
+	}
+	logOutput := runServiceTest(request.Context(), host, service, command)
+	writer.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(writer).Encode(map[string]string{"log": logOutput})
+}
+
+func runServiceTest(parent context.Context, hostName, serviceName, command string) string {
+	// Keep test runs bounded so the editor never hangs the UI for long-running checks.
+	ctx, cancel := context.WithTimeout(parent, 15*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "bash", "-lc", command)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	var logBuilder strings.Builder
+	logBuilder.WriteString("Test run for host=")
+	logBuilder.WriteString(hostName)
+	logBuilder.WriteString(" service=")
+	logBuilder.WriteString(serviceName)
+	logBuilder.WriteString("\n")
+	logBuilder.WriteString("Command: ")
+	logBuilder.WriteString(command)
+	logBuilder.WriteString("\n\n")
+	if stdout.Len() > 0 {
+		logBuilder.WriteString("STDOUT:\n")
+		logBuilder.WriteString(stdout.String())
+		if !strings.HasSuffix(stdout.String(), "\n") {
+			logBuilder.WriteString("\n")
+		}
+	}
+	if stderr.Len() > 0 {
+		logBuilder.WriteString("STDERR:\n")
+		logBuilder.WriteString(stderr.String())
+		if !strings.HasSuffix(stderr.String(), "\n") {
+			logBuilder.WriteString("\n")
+		}
+	}
+	if err != nil {
+		logBuilder.WriteString("Result: FAILED\n")
+		logBuilder.WriteString("Error: ")
+		logBuilder.WriteString(err.Error())
+		logBuilder.WriteString("\n")
+		return logBuilder.String()
+	}
+	logBuilder.WriteString("Result: SUCCESS\n")
+	return logBuilder.String()
 }
 
 func (srv *Server) handleUsers(writer http.ResponseWriter, request *http.Request) {
@@ -1056,6 +1133,10 @@ const indexTemplate = `<!doctype html>
     .stats-item { min-width: 10rem; }
     .live-indicator { font-weight: bold; color: #2c3e50; }
     .trend { font-weight: bold; margin-left: 0.5rem; }
+    .service-actions { margin-left: 0.5rem; display: inline-flex; gap: 0.4rem; }
+    .editor-panel { margin-top: 0.5rem; padding: 0.6rem; border: 1px solid #ddd; border-radius: 6px; background: #fafafa; }
+    .editor-panel[hidden] { display: none; }
+    .log-output { margin-top: 0.5rem; white-space: pre-wrap; background: #111; color: #eee; padding: 0.6rem; border-radius: 6px; font-family: monospace; }
   </style>
 </head>
 <body>
@@ -1254,7 +1335,48 @@ const indexTemplate = `<!doctype html>
             }
           }
         };
-      }
+
+
+      // Keep editor toggles client-side so server templates stay static and light.
+      document.querySelectorAll("[data-edit-toggle]").forEach(function (button) {
+        button.addEventListener("click", function () {
+          var targetId = button.getAttribute("data-edit-toggle");
+          var panel = document.getElementById(targetId);
+          if (!panel) {
+            return;
+          }
+          panel.hidden = !panel.hidden;
+        });
+      });
+
+      // Test-run button executes a backend endpoint and shows captured logs in-place.
+      document.querySelectorAll("[data-test-run]").forEach(function (button) {
+        button.addEventListener("click", function () {
+          var targetId = button.getAttribute("data-log-target");
+          var panel = document.getElementById(targetId);
+          var form = button.closest("form");
+          if (!panel || !form) {
+            return;
+          }
+          panel.textContent = "Running test...";
+          var data = new FormData(form);
+          fetch("/services/test", { method: "POST", body: data })
+            .then(function (response) {
+              if (!response.ok) {
+                return response.text().then(function (text) {
+                  throw new Error(text || "test run failed");
+                });
+              }
+              return response.json();
+            })
+            .then(function (payload) {
+              panel.textContent = payload.log || "No output.";
+            })
+            .catch(function (err) {
+              panel.textContent = "Test run error: " + err.message;
+            });
+        });
+      });
     })();
   </script>
 </body>
@@ -1329,17 +1451,24 @@ const indexTemplate = `<!doctype html>
           {{if .SSHCommand}}<span class="meta"> cmd {{.SSHCommand}}</span>{{end}}
           {{if .CheckedAt}}<div class="meta">Checked: {{.CheckedAt}} — {{.Output}}</div>{{end}}
           {{if $.CanEditMonitoring}}
-            <form method="post" action="/services/update">
+            {{ $editorID := printf "editor-%s-%s" (safeID .HostName) (safeID .Name) }}
+            {{ $logID := printf "log-%s-%s" (safeID .HostName) (safeID .Name) }}
+            <span class="service-actions">
+              <button type="button" data-edit-toggle="{{$editorID}}">Edit task</button>
+            </span>
+            <form id="{{$editorID}}" class="editor-panel" method="post" action="/services/update" hidden>
               <input type="hidden" name="host" value="{{.HostName}}" />
               <input type="hidden" name="service" value="{{.Name}}" />
-              <div class="meta"><strong>Edit monitoring task</strong></div>
+              <div class="meta"><strong>Service task editor</strong></div>
               <div><input type="text" name="command" value="{{.RawCommand}}" placeholder="Check command" /></div>
               <div><input type="text" name="notes" value="{{.Notes}}" placeholder="Notes" /></div>
               <div><input type="number" name="interval" value="{{.Interval}}" placeholder="Interval minutes" /></div>
               <div><input type="text" name="ssh_user" value="{{.SSHUser}}" placeholder="SSH user" /></div>
               <div><input type="text" name="ssh_key_path" value="{{.SSHKeyPath}}" placeholder="SSH key path" /></div>
               <div><input type="text" name="ssh_command" value="{{.SSHCommand}}" placeholder="SSH command" /></div>
-              <button type="submit">Save monitoring task</button>
+              <button type="submit">Save</button>
+              <button type="button" data-test-run data-log-target="{{$logID}}">Test run</button>
+              <div id="{{$logID}}" class="log-output"></div>
             </form>
           {{end}}
         </li>
@@ -1444,17 +1573,24 @@ const hostsTemplate = `{{range .Heads}}
           {{if .SSHCommand}}<span class="meta"> cmd {{.SSHCommand}}</span>{{end}}
           {{if .CheckedAt}}<div class="meta">Checked: {{.CheckedAt}} — {{.Output}}</div>{{end}}
           {{if $.CanEditMonitoring}}
-            <form method="post" action="/services/update">
+            {{ $editorID := printf "editor-%s-%s" (safeID .HostName) (safeID .Name) }}
+            {{ $logID := printf "log-%s-%s" (safeID .HostName) (safeID .Name) }}
+            <span class="service-actions">
+              <button type="button" data-edit-toggle="{{$editorID}}">Edit task</button>
+            </span>
+            <form id="{{$editorID}}" class="editor-panel" method="post" action="/services/update" hidden>
               <input type="hidden" name="host" value="{{.HostName}}" />
               <input type="hidden" name="service" value="{{.Name}}" />
-              <div class="meta"><strong>Edit monitoring task</strong></div>
+              <div class="meta"><strong>Service task editor</strong></div>
               <div><input type="text" name="command" value="{{.RawCommand}}" placeholder="Check command" /></div>
               <div><input type="text" name="notes" value="{{.Notes}}" placeholder="Notes" /></div>
               <div><input type="number" name="interval" value="{{.Interval}}" placeholder="Interval minutes" /></div>
               <div><input type="text" name="ssh_user" value="{{.SSHUser}}" placeholder="SSH user" /></div>
               <div><input type="text" name="ssh_key_path" value="{{.SSHKeyPath}}" placeholder="SSH key path" /></div>
               <div><input type="text" name="ssh_command" value="{{.SSHCommand}}" placeholder="SSH command" /></div>
-              <button type="submit">Save monitoring task</button>
+              <button type="submit">Save</button>
+              <button type="button" data-test-run data-log-target="{{$logID}}">Test run</button>
+              <div id="{{$logID}}" class="log-output"></div>
             </form>
           {{end}}
         </li>
@@ -1504,6 +1640,28 @@ func statusBadge(class string) string {
 	default:
 		return "badge-unknown"
 	}
+}
+
+func safeID(value string) string {
+	// Normalize dynamic ids so host/service names cannot break HTML selectors.
+	if strings.TrimSpace(value) == "" {
+		return "item"
+	}
+	var builder strings.Builder
+	for _, char := range value {
+		isLetter := char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z'
+		isNumber := char >= '0' && char <= '9'
+		if isLetter || isNumber || char == '-' || char == '_' {
+			builder.WriteRune(char)
+			continue
+		}
+		builder.WriteByte('-')
+	}
+	clean := strings.Trim(builder.String(), "-")
+	if clean == "" {
+		return "item"
+	}
+	return clean
 }
 
 // ---- Lifecycle ----

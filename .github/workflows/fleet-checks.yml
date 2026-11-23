@@ -1,0 +1,25 @@
+name: Fleet checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - feat/hetzner-selectel-fleet-inventory
+
+jobs:
+  go-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test all packages
+        run: go test ./...
+      - name: Build monitoring server and fleet inventory
+        run: |
+          go build -o /tmp/chicha-pulse .
+          go build -o /tmp/chicha-fleet-inventory ./cmd/fleet-inventory

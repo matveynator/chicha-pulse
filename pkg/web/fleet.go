@@ -16,6 +16,7 @@ type fleetHostView struct {
 	State fleet.HostState
 }
 type fleetPageView struct {
+	CanAdmin bool
 	UpdatedAt string
 	Online, Offline, Unknown int
 	Hosts []fleetHostView
@@ -40,7 +41,7 @@ func (srv *Server) SetFleetMonitor(m *fleet.Monitor) {
 }
 
 func (srv *Server) loadFleetPage(request *http.Request) (fleetPageView, error) {
-	view := fleetPageView{Enabled: srv.fleet != nil}
+	view := fleetPageView{Enabled: srv.fleet != nil, CanAdmin: srv.permissionsFromRequest(request).CanAdmin}
 	if srv.fleet == nil { return view, nil }
 	snap, err := srv.fleet.Snapshot(request.Context())
 	if err != nil { return view, err }
@@ -168,7 +169,7 @@ button{background:#233449;color:#e6edf3;border:1px solid #3d5269;padding:8px 12p
 </style>
 </head>
 <body>
-<header><a class="home" href="/fleet">chicha<span style="color:#5ac595">•</span>pulse / fleet</a><nav><a href="/">Monitoring</a><a href="/fleet/metrics">Prometheus</a></nav></header>
+<header><a class="home" href="/fleet">chicha<span style="color:#5ac595">•</span>pulse / fleet</a><nav><a href="/">Monitoring</a><a href="/fleet/metrics">Prometheus</a>{{if .CanAdmin}}<a href="/fleet/settings">Настройки</a>{{end}}</nav></header>
 <main>
 <div class="toolbar">
   <div><h1>Infrastructure fleet</h1><div class="muted">Hetzner · Selectel · SSH-based inventory and telemetry</div></div>

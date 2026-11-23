@@ -1,3 +1,50 @@
+# Live fleet dashboard
+
+In addition to the one-shot export below, chicha-pulse now has a built-in,
+continuously refreshed **/fleet** dashboard. The existing monitoring, Nagios
+import, authentication, roles and main homepage remain available.
+
+### Start the web dashboard
+
+Configure provider credentials as shown below, make sure the monitor machine
+can log into each target with a verified SSH host key, then run:
+
+```sh
+go run . -fleet -web-addr 127.0.0.1:8080 \
+  -fleet-ssh-user inventory \
+  -fleet-ssh-key ~/.ssh/id_ed25519 \
+  -fleet-interval 90s
+```
+
+Open http://127.0.0.1:8080/fleet using the existing chicha-pulse HTTP
+Basic Auth credentials (on first setup, the generated superuser credentials
+appear in the startup log). Serve over HTTPS or a trusted VPN when accessed
+remotely; **never transmit Basic Auth over plain HTTP across the internet**.
+
+Each host has a live green (last SSH succeeded), red (failed) or amber (not
+verified, e.g. host key or credentials missing) indicator. Clicking it opens:
+
+* OS, CPU, memory and disk inventory, RAID, SMART health and filesystem mounts;
+* process list (PID, executable name, CPU and RAM) without process arguments;
+* running services, listening ports, interface addresses and routing tables;
+* application versions and up to 2,000 installed system packages;
+* recent load, CPU, memory, disk, network RX/TX charts (120 in-memory samples).
+  CPU/network sampling requires two Linux counter reads. OpenBSD support is
+  best-effort and excludes unavailable Linux-only counters.
+
+The panel polls `/fleet/data` every 15 seconds. This is a **snapshot-based**
+SSH collector, not the Prometheus node_exporter binary. History is currently
+held in memory and is lost after restart. For long-term retention, a Prometheus
+server can scrape the authenticated `/fleet/metrics` endpoint. The endpoint
+requires monitoring view credentials and must not be public.
+
+Status is **SSH reachability**, not a substitute for application checks:
+a green host can still have a failed service. Nagios service status remains
+on the primary dashboard. The full read-only scan is run periodically; no
+agent needs to be installed on monitored servers.
+
+---
+
 # Cloud provider fleet inventory (Hetzner and Selectel)
 
 The standalone command `go run ./cmd/fleet-inventory` discovers dedicated servers in Hetzner Robot and Selectel, and optionally virtual machines from Hetzner Cloud. It probes reachable hosts over SSH using read-only commands and outputs JSON or CSV. It does not modify the existing chicha-pulse Nagios monitoring service.

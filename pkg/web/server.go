@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"chicha-pulse/pkg/auth"
+	"chicha-pulse/pkg/fleet"
 	"chicha-pulse/pkg/model"
 	"chicha-pulse/pkg/store"
 )
@@ -25,6 +26,8 @@ import (
 // ---- Server ----
 
 type Server struct {
+	fleetCSRF      string
+	fleet          *fleet.Monitor
 	store          *store.Store
 	authManager    *auth.Manager
 	template       *template.Template
@@ -59,7 +62,10 @@ func NewServer(st *store.Store, authManager *auth.Manager, pageTitle string, all
 		"statusBadge": statusBadge,
 		"safeID":      safeID,
 	}).Parse(hostsTemplate))
+	csrf, err := newFleetCSRF()
+	if err != nil { return nil, err }
 	return &Server{
+		fleetCSRF:      csrf,
 		store:          st,
 		authManager:    authManager,
 		template:       page,
@@ -74,6 +80,10 @@ func NewServer(st *store.Store, authManager *auth.Manager, pageTitle string, all
 func (srv *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleIndex)
+	mux.HandleFunc("/fleet", srv.handleFleetPage)
+	mux.HandleFunc("/fleet/settings", srv.handleFleetSettings)
+	mux.HandleFunc("/fleet/data", srv.handleFleetData)
+	mux.HandleFunc("/fleet/metrics", srv.handleFleetMetrics)
 	mux.HandleFunc("/events/stats", srv.handleStatsEvents)
 	mux.HandleFunc("/events/alerts", srv.handleAlertsEvents)
 	mux.HandleFunc("/events/hosts", srv.handleHostsEvents)
@@ -1180,6 +1190,8 @@ const indexTemplate = `<!doctype html>
 </head>
 <body>
   <h1>{{.Title}}</h1>
+  <div class="card"><a href="/fleet">Fleet dashboard — servers, SSH status, hardware and processes</a></div>
+  {{if .CanAdmin}}<div class="card"><a href="/fleet/settings">Configure Hetzner, Selectel and SSH connections</a></div>{{end}}
 
   {{if .CanViewMonitoring}}
     <div class="card">

@@ -1,0 +1,277 @@
+package fleet
+
+// Monitor owns the live fleet snapshot in one goroutine. Provider and SSH work
+// happens in a separate goroutine, so HTTP snapshots never wait for a scan.
+import (
+	"context"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type Sample struct {
+	At               time.Time `json:"at"`
+	Load1            float64   `json:"load1"`
+	MemoryUsedPct    float64   `json:"memory_used_pct"`
+	RootDiskUsedPct  float64   `json:"root_disk_used_pct"`
+	CPUUsedPct       float64   `json:"cpu_used_pct"`
+	NetworkRXBPS     float64   `json:"network_rx_bps"`
+	NetworkTXBPS     float64   `json:"network_tx_bps"`
+	CPUTotalTicks    float64   `json:"-"`
+	CPUIdleTicks     float64   `json:"-"`
+	NetworkRXBytes   float64   `json:"-"`
+	NetworkTXBytes   float64   `json:"-"`
+	HasLoad          bool      `json:"has_load"`
+	HasMemory        bool      `json:"has_memory"`
+	HasDisk          bool      `json:"has_disk"`
+	HasCPU           bool      `json:"has_cpu"`
+	HasNetwork       bool      `json:"has_network"`
+}
+
+type HostState struct {
+	Host       Host      `json:"host"`
+	Status     string    `json:"status"` // online, offline or unknown
+	LastProbe  time.Time `json:"last_probe,omitempty"`
+	LastOnline time.Time `json:"last_online,omitempty"`
+	SSH        Probe     `json:"ssh"`
+	History    []Sample  `json:"history,omitempty"`
+}
+
+type FleetSnapshot struct {
+	UpdatedAt time.Time   `json:"updated_at,omitempty"`
+	Hosts     []HostState `json:"hosts"`
+	Errors    []string    `json:"errors,omitempty"`
+}
+
+type Monitor struct {
+	requests chan chan FleetSnapshot
+	refresh chan struct{}
+}
+
+// StartMonitor is kept for callers that provide a fixed configuration.
+func StartMonitor(ctx context.Context, cfg Config, ssh SSHOptions, interval time.Duration) *Monitor {
+	return StartMonitorWithLoader(ctx, func() (Config, SSHOptions, time.Duration, error) {
+		return cfg, ssh, interval, nil
+	})
+}
+
+// StartMonitorWithLoader re-reads settings for every scan; saving the web form
+// requests an immediate refresh without restarting the web server.
+func StartMonitorWithLoader(ctx context.Context, loader func() (Config, SSHOptions, time.Duration, error)) *Monitor {
+	m := &Monitor{
+		requests: make(chan chan FleetSnapshot),
+		refresh: make(chan struct{}, 1),
+	}
+	results := make(chan FleetSnapshot, 1)
+	go func() {
+		for {
+			cfg, ssh, interval, loadErr := loader()
+			if interval < 30*time.Second {
+				interval = 90*time.Second
+			}
+			var hosts []Host
+			var problems []string
+			if loadErr != nil {
+				problems = append(problems, "fleet settings: "+loadErr.Error())
+			} else {
+				hosts, problems = Discover(ctx, cfg)
+			}
+			current := FleetSnapshot{UpdatedAt: time.Now().UTC(), Errors: problems}
+			scanned := Scan(ctx, hosts, ssh)
+			for _, r := range scanned {
+				status := "offline"
+				if r.SSH.Error == "" {
+					status = "online"
+				} else if strings.HasPrefix(r.SSH.Error, "no main IPv4") ||
+					strings.Contains(r.SSH.Error, "Host key verification failed") ||
+					strings.Contains(r.SSH.Error, "Permission denied") {
+					status = "unknown"
+				}
+				current.Hosts = append(current.Hosts, HostState{Host: r.Host, SSH: r.SSH, Status: status, LastProbe: time.Now().UTC()})
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case results <- current:
+			}
+			timer := time.NewTimer(interval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			case <-m.refresh:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+			}
+		}
+	}()
+
+	go func() {
+		current := FleetSnapshot{Hosts: []HostState{}}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case response := <-m.requests:
+				response <- cloneFleetSnapshot(current)
+			case latest := <-results:
+				previous := make(map[string]HostState, len(current.Hosts))
+				for _, h := range current.Hosts {
+					previous[h.Host.Provider+"/"+h.Host.ID] = h
+				}
+				// Keep previously known assets visible when a provider API fails.
+				// Never keep them green: their last discovery is no longer trustworthy.
+				present := make(map[string]bool, len(latest.Hosts))
+				for _, host := range latest.Hosts { present[host.Host.Provider+"/"+host.Host.ID] = true }
+				for key, old := range previous {
+					if present[key] || !providerFailed(latest.Errors, old.Host.Provider) { continue }
+					old.Status = "unknown"
+					old.SSH.Error = "provider discovery failed; previous metadata preserved"
+					latest.Hosts = append(latest.Hosts, old)
+				}
+				for i := range latest.Hosts {
+					next := &latest.Hosts[i]
+					if strings.HasPrefix(next.SSH.Error, "provider discovery failed") { continue }
+					if old, exists := previous[next.Host.Provider+"/"+next.Host.ID]; exists {
+						next.History = append(next.History, old.History...)
+						next.LastOnline = old.LastOnline
+					}
+					if next.Status == "online" {
+						next.LastOnline = next.LastProbe
+						if sample, ok := parseSample(next.SSH.Sections["metrics"], next.LastProbe); ok {
+							if len(next.History) > 0 {
+							prev := next.History[len(next.History)-1]
+							totalDelta := sample.CPUTotalTicks - prev.CPUTotalTicks
+							idleDelta := sample.CPUIdleTicks - prev.CPUIdleTicks
+							if totalDelta > 0 && idleDelta >= 0 && idleDelta <= totalDelta {
+								sample.CPUUsedPct = (1 - idleDelta / totalDelta) * 100
+								sample.HasCPU = true
+							}
+							seconds := sample.At.Sub(prev.At).Seconds()
+							if seconds > 0 {
+								if delta := sample.NetworkRXBytes - prev.NetworkRXBytes; delta >= 0 { sample.NetworkRXBPS = delta / seconds }
+								if delta := sample.NetworkTXBytes - prev.NetworkTXBytes; delta >= 0 { sample.NetworkTXBPS = delta / seconds }
+								if sample.NetworkRXBytes >= prev.NetworkRXBytes && sample.NetworkTXBytes >= prev.NetworkTXBytes && sample.NetworkRXBytes > 0 { sample.HasNetwork = true }
+							}
+						}
+						next.History = append(next.History, sample)
+						}
+					}
+					if len(next.History) > 120 {
+						next.History = next.History[len(next.History)-120:]
+					}
+				}
+				sort.Slice(latest.Hosts, func(i, j int) bool {
+					if latest.Hosts[i].Host.Provider != latest.Hosts[j].Host.Provider {
+						return latest.Hosts[i].Host.Provider < latest.Hosts[j].Host.Provider
+					}
+					return latest.Hosts[i].Host.Name < latest.Hosts[j].Host.Name
+				})
+				current = latest
+			}
+		}
+	}()
+	return m
+}
+
+// Refresh schedules an early scan. Multiple requests coalesce.
+func (m *Monitor) Refresh() {
+	select {
+	case m.refresh <- struct{}{}:
+	default:
+	}
+}
+
+func (m *Monitor) Snapshot(ctx context.Context) (FleetSnapshot, error) {
+	result := make(chan FleetSnapshot, 1)
+	select {
+	case <-ctx.Done():
+		return FleetSnapshot{}, ctx.Err()
+	case m.requests <- result:
+	}
+	select {
+	case <-ctx.Done():
+		return FleetSnapshot{}, ctx.Err()
+	case v := <-result:
+		return v, nil
+	}
+}
+
+func cloneFleetSnapshot(v FleetSnapshot) FleetSnapshot {
+	out := FleetSnapshot{UpdatedAt: v.UpdatedAt, Errors: append([]string(nil), v.Errors...), Hosts: make([]HostState, len(v.Hosts))}
+	for i, h := range v.Hosts {
+		out.Hosts[i] = h
+		out.Hosts[i].Host.Addresses = append([]Address(nil), h.Host.Addresses...)
+		out.Hosts[i].Host.Subnets = append([]string(nil), h.Host.Subnets...)
+		out.Hosts[i].Host.Warnings = append([]string(nil), h.Host.Warnings...)
+		out.Hosts[i].History = append([]Sample(nil), h.History...)
+		out.Hosts[i].SSH.Sections = make(map[string]string, len(h.SSH.Sections))
+		for k, value := range h.SSH.Sections {
+			out.Hosts[i].SSH.Sections[k] = value
+		}
+	}
+	return out
+}
+
+func parseSample(raw string, at time.Time) (Sample, bool) {
+	s := Sample{At: at}
+	if raw == "" {
+		return s, false
+	}
+	var memTotal, memAvailable float64
+	memAvailableSeen := false
+	for _, line := range strings.Split(raw, "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		value, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+		if err != nil {
+			continue
+		}
+		switch parts[0] {
+		case "load1":
+			s.Load1 = value
+			s.HasLoad = true
+		case "mem_total_kb":
+			memTotal = value
+		case "mem_available_kb":
+			memAvailable = value
+			memAvailableSeen = true
+		case "root_disk_pct":
+			s.RootDiskUsedPct = value
+			s.HasDisk = true
+		case "cpu_total_ticks":
+			s.CPUTotalTicks = value
+		case "cpu_idle_ticks":
+			s.CPUIdleTicks = value
+		case "net_rx_bytes":
+			s.NetworkRXBytes = value
+		case "net_tx_bytes":
+			s.NetworkTXBytes = value
+		}
+	}
+	if memTotal > 0 && memAvailableSeen {
+		s.HasMemory = true
+		s.MemoryUsedPct = (memTotal - memAvailable) / memTotal * 100
+	}
+	if s.MemoryUsedPct < 0 {
+		s.MemoryUsedPct = 0
+	}
+	return s, true
+}
+
+func providerFailed(errors []string, provider string) bool {
+	prefix := provider + ":"
+	if provider == "hetzner-cloud" { prefix = "hetzner cloud:" }
+	for _, message := range errors {
+		if strings.HasPrefix(message, prefix) { return true }
+	}
+	return false
+}

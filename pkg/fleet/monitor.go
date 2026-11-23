@@ -83,6 +83,16 @@ func StartMonitor(ctx context.Context, cfg Config, ssh SSHOptions, interval time
 				for _, h := range current.Hosts {
 					previous[h.Host.Provider+"/"+h.Host.ID] = h
 				}
+				// Keep previously known assets visible when a provider API fails.
+				// Never keep them green: their last discovery is no longer trustworthy.
+				present := make(map[string]bool, len(latest.Hosts))
+				for _, host := range latest.Hosts { present[host.Host.Provider+"/"+host.Host.ID] = true }
+				for key, old := range previous {
+					if present[key] || !providerFailed(latest.Errors, old.Host.Provider) { continue }
+					old.Status = "unknown"
+					old.SSH.Error = "provider discovery failed; previous metadata preserved"
+					latest.Hosts = append(latest.Hosts, old)
+				}
 				for i := range latest.Hosts {
 					next := &latest.Hosts[i]
 					if old, exists := previous[next.Host.Provider+"/"+next.Host.ID]; exists {
@@ -176,4 +186,13 @@ func parseSample(raw string, at time.Time) (Sample, bool) {
 		s.MemoryUsedPct = 0
 	}
 	return s, true
+}
+
+func providerFailed(errors []string, provider string) bool {
+	prefix := provider + ":"
+	if provider == "hetzner-cloud" { prefix = "hetzner cloud:" }
+	for _, message := range errors {
+		if strings.HasPrefix(message, prefix) { return true }
+	}
+	return false
 }

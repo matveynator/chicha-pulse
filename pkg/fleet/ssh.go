@@ -134,6 +134,9 @@ if test -r /proc/meminfo; then awk '/^MemTotal:/ {print "mem_total_kb="$2} /^Mem
 fi
 df -Pk / 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5);print "root_disk_pct="$5}'
 
+if test -r /proc/stat; then awk '/^cpu / {total=0;for(i=2;i<=NF;i++) total+=$i;print "cpu_total_ticks="total;print "cpu_idle_ticks="$5}' /proc/stat; fi
+if test -r /proc/net/dev; then awk 'NR>2 {gsub(/:/," ");if($1!="lo"){rx+=$2;tx+=$10}} END {print "net_rx_bytes="rx;print "net_tx_bytes="tx}' /proc/net/dev; fi
+
 `
 func probeHost(ctx context.Context, h Host, opts SSHOptions) Probe {
 	if h.MainIP == "" {

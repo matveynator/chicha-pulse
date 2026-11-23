@@ -35,6 +35,9 @@ func SettingsPath() string {
 	if path := strings.TrimSpace(os.Getenv("CHICHA_FLEET_SETTINGS_FILE")); path != "" {
 		return path
 	}
+	if dir, err := os.UserConfigDir(); err == nil {
+		return filepath.Join(dir, "chicha-pulse", "fleet-settings.enc")
+	}
 	return "/var/lib/chicha-pulse/fleet-settings.enc"
 }
 

@@ -46,26 +46,46 @@ type FleetSnapshot struct {
 
 type Monitor struct {
 	requests chan chan FleetSnapshot
+	refresh chan struct{}
 }
 
+// StartMonitor is kept for callers that provide a fixed configuration.
 func StartMonitor(ctx context.Context, cfg Config, ssh SSHOptions, interval time.Duration) *Monitor {
-	if interval < 15*time.Second {
-		interval = 90 * time.Second
+	return StartMonitorWithLoader(ctx, func() (Config, SSHOptions, time.Duration, error) {
+		return cfg, ssh, interval, nil
+	})
+}
+
+// StartMonitorWithLoader re-reads settings for every scan; saving the web form
+// requests an immediate refresh without restarting the web server.
+func StartMonitorWithLoader(ctx context.Context, loader func() (Config, SSHOptions, time.Duration, error)) *Monitor {
+	m := &Monitor{
+		requests: make(chan chan FleetSnapshot),
+		refresh: make(chan struct{}, 1),
 	}
-	m := &Monitor{requests: make(chan chan FleetSnapshot)}
 	results := make(chan FleetSnapshot, 1)
 	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
 		for {
-			hosts, errors := Discover(ctx, cfg)
-			current := FleetSnapshot{UpdatedAt: time.Now().UTC(), Errors: errors}
+			cfg, ssh, interval, loadErr := loader()
+			if interval < 30*time.Second {
+				interval = 90*time.Second
+			}
+			var hosts []Host
+			var problems []string
+			if loadErr != nil {
+				problems = append(problems, "fleet settings: "+loadErr.Error())
+			} else {
+				hosts, problems = Discover(ctx, cfg)
+			}
+			current := FleetSnapshot{UpdatedAt: time.Now().UTC(), Errors: problems}
 			scanned := Scan(ctx, hosts, ssh)
 			for _, r := range scanned {
 				status := "offline"
 				if r.SSH.Error == "" {
 					status = "online"
-				} else if strings.HasPrefix(r.SSH.Error, "no main IPv4") || strings.Contains(r.SSH.Error, "Host key verification failed") || strings.Contains(r.SSH.Error, "Permission denied") {
+				} else if strings.HasPrefix(r.SSH.Error, "no main IPv4") ||
+					strings.Contains(r.SSH.Error, "Host key verification failed") ||
+					strings.Contains(r.SSH.Error, "Permission denied") {
 					status = "unknown"
 				}
 				current.Hosts = append(current.Hosts, HostState{Host: r.Host, SSH: r.SSH, Status: status, LastProbe: time.Now().UTC()})
@@ -75,13 +95,23 @@ func StartMonitor(ctx context.Context, cfg Config, ssh SSHOptions, interval time
 				return
 			case results <- current:
 			}
+			timer := time.NewTimer(interval)
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return
-			case <-ticker.C:
+			case <-timer.C:
+			case <-m.refresh:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
 			}
 		}
 	}()
+
 	go func() {
 		current := FleetSnapshot{Hosts: []HostState{}}
 		for {
@@ -148,6 +178,14 @@ func StartMonitor(ctx context.Context, cfg Config, ssh SSHOptions, interval time
 		}
 	}()
 	return m
+}
+
+// Refresh schedules an early scan. Multiple requests coalesce.
+func (m *Monitor) Refresh() {
+	select {
+	case m.refresh <- struct{}{}:
+	default:
+	}
 }
 
 func (m *Monitor) Snapshot(ctx context.Context) (FleetSnapshot, error) {

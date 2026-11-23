@@ -114,7 +114,7 @@ func (srv *Server) handleFleetMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 }
 func escapePromLabel(s string) string { return strings.ReplaceAll(strings.ReplaceAll(s, "\n", " "), "\r", " ") }
-var fleetTemplate = template.Must(template.New("fleet").Parse`<!doctype html>
+var fleetTemplate = template.Must(template.New("fleet").Parse(`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -206,8 +206,6 @@ button{background:#233449;color:#e6edf3;border:1px solid #3d5269;padding:8px 12p
  <div class="chart"><label>Memory utilization</label><canvas width="320" height="116" data-metric="memory_used_pct"></canvas></div>
  <div class="chart"><label>Root filesystem utilization</label><canvas width="320" height="116" data-metric="root_disk_used_pct"></canvas></div>
 </div>
-{{range $name, $label := .State.SSH.Sections}}
-{{end}}
 <details class="section" open><summary>Hardware · CPU · memory</summary><pre data-section="hardware">{{index .State.SSH.Sections "hardware"}}</pre><pre data-section="memory">{{index .State.SSH.Sections "memory"}}</pre></details>
 <details class="section" open><summary>Disks · filesystem · RAID · SMART</summary><pre data-section="disks">{{index .State.SSH.Sections "disks"}}</pre><pre data-section="filesystem">{{index .State.SSH.Sections "filesystem"}}</pre><pre data-section="raid">{{index .State.SSH.Sections "raid"}}</pre><pre data-section="smart">{{index .State.SSH.Sections "smart"}}</pre></details>
 <details class="section" open><summary>Active processes (PID, name, CPU, RAM)</summary><pre data-section="processes">{{index .State.SSH.Sections "processes"}}</pre></details>

@@ -17,6 +17,7 @@ import (
 	"chicha-pulse/pkg/alert"
 	"chicha-pulse/pkg/auth"
 	"chicha-pulse/pkg/checker"
+	"chicha-pulse/pkg/fleet"
 	"chicha-pulse/pkg/model"
 	"chicha-pulse/pkg/nagiosimport"
 	"chicha-pulse/pkg/notify"
@@ -47,6 +48,11 @@ type Configuration struct {
 	SSLEmail         string
 	WebAllowIPs      []string
 	SetupMode        bool
+	FleetEnabled     bool
+	FleetSSHUser     string
+	FleetSSHKey      string
+	FleetSSHPort     int
+	FleetInterval    time.Duration
 }
 
 // ---- Entry point ----
@@ -90,11 +96,14 @@ func main() {
 	}
 
 	st := store.New(ctx)
+	if config.ImportNagiosPath != "" {
 	if err := runImport(ctx, st, config.ImportNagiosPath); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	}
 
+	if config.DatabaseDriver == "" && config.FleetEnabled { config.DatabaseDriver = "sqlite" }
 	database, err := storage.Open(ctx, config.DatabaseDriver, config.DatabaseDSN)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -145,6 +154,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	if config.FleetEnabled {
+		srv.SetFleetMonitor(fleet.StartMonitor(ctx, fleet.FromEnvironment(), fleet.SSHOptions{
+			User: config.FleetSSHUser,
+			KeyPath: config.FleetSSHKey,
+			Port: config.FleetSSHPort,
+			Workers: 8,
+			Timeout: 25*time.Second,
+		}, config.FleetInterval))
+	}
+
 	httpServer := &http.Server{
 		Addr:    config.WebAddress,
 		Handler: srv.Handler(),
@@ -172,6 +191,11 @@ func parseFlags() Configuration {
 	flag.StringVar(&config.ImportNagiosPath, "import-nagios", "", "Path to Nagios config directory or nagios.cfg")
 	flag.StringVar(&config.WebAddress, "web-addr", ":8080", "HTTP listen address")
 	flag.BoolVar(&config.SetupMode, "setup", false, "Run interactive setup")
+	flag.BoolVar(&config.FleetEnabled, "fleet", false, "Enable Hetzner/Selectel SSH fleet dashboard at /fleet")
+	flag.StringVar(&config.FleetSSHUser, "fleet-ssh-user", "root", "SSH user for fleet probes")
+	flag.StringVar(&config.FleetSSHKey, "fleet-ssh-key", "", "SSH private key path for fleet probes")
+	flag.IntVar(&config.FleetSSHPort, "fleet-ssh-port", 22, "SSH port for fleet probes")
+	flag.DurationVar(&config.FleetInterval, "fleet-interval", 90*time.Second, "Fleet collection interval")
 	flag.Parse()
 	return config
 }
@@ -188,6 +212,10 @@ func printHelp() {
 	fmt.Fprintf(os.Stderr, "%s1) General settings & setup%s\n", cyan, reset)
 	fmt.Fprintln(os.Stderr, "  -setup                 Run interactive setup wizard")
 	fmt.Fprintln(os.Stderr, "  -web-addr              HTTP listen address (default :8080)")
+	fmt.Fprintln(os.Stderr, "  -fleet                 Enable fleet status dashboard at /fleet")
+	fmt.Fprintln(os.Stderr, "  -fleet-ssh-user        Fleet SSH user (default root)")
+	fmt.Fprintln(os.Stderr, "  -fleet-ssh-key         Fleet SSH identity file")
+	fmt.Fprintln(os.Stderr, "  -fleet-interval        Collection interval (default 90s)")
 	fmt.Fprintln(os.Stderr, "")
 
 	fmt.Fprintf(os.Stderr, "%s2) Import flags%s\n", cyan, reset)
@@ -200,8 +228,8 @@ func printHelp() {
 }
 
 func validateConfig(config Configuration) error {
-	if config.ImportNagiosPath == "" {
-		return fmt.Errorf("import-nagios is required to bootstrap inventory")
+	if config.ImportNagiosPath == "" && !config.FleetEnabled {
+		return fmt.Errorf("import-nagios is required unless -fleet is enabled")
 	}
 	return nil
 }

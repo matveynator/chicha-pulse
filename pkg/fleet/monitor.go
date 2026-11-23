@@ -22,6 +22,11 @@ type Sample struct {
 	CPUIdleTicks     float64   `json:"-"`
 	NetworkRXBytes   float64   `json:"-"`
 	NetworkTXBytes   float64   `json:"-"`
+	HasLoad          bool      `json:"has_load"`
+	HasMemory        bool      `json:"has_memory"`
+	HasDisk          bool      `json:"has_disk"`
+	HasCPU           bool      `json:"has_cpu"`
+	HasNetwork       bool      `json:"has_network"`
 }
 
 type HostState struct {
@@ -116,11 +121,13 @@ func StartMonitor(ctx context.Context, cfg Config, ssh SSHOptions, interval time
 							idleDelta := sample.CPUIdleTicks - prev.CPUIdleTicks
 							if totalDelta > 0 && idleDelta >= 0 && idleDelta <= totalDelta {
 								sample.CPUUsedPct = (1 - idleDelta / totalDelta) * 100
+								sample.HasCPU = true
 							}
 							seconds := sample.At.Sub(prev.At).Seconds()
 							if seconds > 0 {
 								if delta := sample.NetworkRXBytes - prev.NetworkRXBytes; delta >= 0 { sample.NetworkRXBPS = delta / seconds }
 								if delta := sample.NetworkTXBytes - prev.NetworkTXBytes; delta >= 0 { sample.NetworkTXBPS = delta / seconds }
+								if sample.NetworkRXBytes >= prev.NetworkRXBytes && sample.NetworkTXBytes >= prev.NetworkTXBytes && sample.NetworkRXBytes > 0 { sample.HasNetwork = true }
 							}
 						}
 						next.History = append(next.History, sample)
@@ -180,6 +187,7 @@ func parseSample(raw string, at time.Time) (Sample, bool) {
 		return s, false
 	}
 	var memTotal, memAvailable float64
+	memAvailableSeen := false
 	for _, line := range strings.Split(raw, "\n") {
 		parts := strings.SplitN(strings.TrimSpace(line), "=", 2)
 		if len(parts) != 2 {
@@ -192,12 +200,15 @@ func parseSample(raw string, at time.Time) (Sample, bool) {
 		switch parts[0] {
 		case "load1":
 			s.Load1 = value
+			s.HasLoad = true
 		case "mem_total_kb":
 			memTotal = value
 		case "mem_available_kb":
 			memAvailable = value
+			memAvailableSeen = true
 		case "root_disk_pct":
 			s.RootDiskUsedPct = value
+			s.HasDisk = true
 		case "cpu_total_ticks":
 			s.CPUTotalTicks = value
 		case "cpu_idle_ticks":
@@ -208,7 +219,8 @@ func parseSample(raw string, at time.Time) (Sample, bool) {
 			s.NetworkTXBytes = value
 		}
 	}
-	if memTotal > 0 {
+	if memTotal > 0 && memAvailableSeen {
+		s.HasMemory = true
 		s.MemoryUsedPct = (memTotal - memAvailable) / memTotal * 100
 	}
 	if s.MemoryUsedPct < 0 {

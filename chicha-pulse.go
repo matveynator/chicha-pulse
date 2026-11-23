@@ -155,13 +155,15 @@ func main() {
 	}
 
 	if config.FleetEnabled {
-		srv.SetFleetMonitor(fleet.StartMonitor(ctx, fleet.FromEnvironment(), fleet.SSHOptions{
+		srv.SetFleetMonitor(fleet.StartMonitorWithLoader(ctx, func() (fleet.Config, fleet.SSHOptions, time.Duration, error) {
+			return fleet.ResolveSettings(fleet.SettingsPath(), fleet.FromEnvironment(), fleet.SSHOptions{
 			User: config.FleetSSHUser,
 			KeyPath: config.FleetSSHKey,
 			Port: config.FleetSSHPort,
 			Workers: 8,
 			Timeout: 25*time.Second,
-		}, config.FleetInterval))
+			}, config.FleetInterval)
+		}))
 	}
 
 	httpServer := &http.Server{

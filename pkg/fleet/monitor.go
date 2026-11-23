@@ -95,6 +95,7 @@ func StartMonitor(ctx context.Context, cfg Config, ssh SSHOptions, interval time
 				}
 				for i := range latest.Hosts {
 					next := &latest.Hosts[i]
+					if strings.HasPrefix(next.SSH.Error, "provider discovery failed") { continue }
 					if old, exists := previous[next.Host.Provider+"/"+next.Host.ID]; exists {
 						next.History = append(next.History, old.History...)
 						next.LastOnline = old.LastOnline

@@ -107,7 +107,7 @@ func (srv *Server) handleFleetMetrics(w http.ResponseWriter, r *http.Request) {
 		up := 0
 		if item.Status == "online" { up = 1 }
 		fmt.Fprintf(w, "chicha_fleet_ssh_up%s %d\n", labels, up)
-		if len(item.History) == 0 { continue }
+		if item.Status != "online" || len(item.History) == 0 { continue }
 		s := item.History[len(item.History)-1]
 		if s.HasLoad { fmt.Fprintf(w, "chicha_fleet_load1%s %.3f\n", labels, s.Load1) }
 		if s.HasMemory { fmt.Fprintf(w, "chicha_fleet_memory_used_percent%s %.3f\n", labels, s.MemoryUsedPct) }

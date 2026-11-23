@@ -168,6 +168,12 @@ func ResolveSettings(path string, env Config, ssh SSHOptions, interval time.Dura
 	if err != nil {
 		return env, ssh, interval, err
 	}
+return MergeSettings(env, ssh, interval, saved)
+}
+
+// MergeSettings is also used by the web form's "Test" action: it can verify
+// entered credentials in memory without writing them to disk.
+func MergeSettings(env Config, ssh SSHOptions, interval time.Duration, saved Settings) (Config, SSHOptions, time.Duration, error) {
 	if saved.RobotUser != "" { env.HetznerUser = saved.RobotUser }
 	if saved.RobotPassword != "" { env.HetznerPassword = saved.RobotPassword }
 	if saved.CloudToken != "" { env.HetznerCloudToken = saved.CloudToken }

@@ -103,6 +103,37 @@ section addresses; if command -v ip >/dev/null 2>&1; then ip -o address show 2>/
 section routes; if command -v ip >/dev/null 2>&1; then ip route show 2>/dev/null | head -80; ip -6 route show 2>/dev/null | head -80; else netstat -rn 2>/dev/null | head -120; fi
 section services; if command -v systemctl >/dev/null 2>&1; then systemctl list-units --type=service --state=running --no-legend --no-pager 2>/dev/null | head -100; elif command -v rcctl >/dev/null 2>&1; then rcctl ls started 2>/dev/null | head -100; else service -e 2>/dev/null | head -100; fi
 section listeners; if command -v ss >/dev/null 2>&1; then ss -lntu 2>/dev/null | head -100; else netstat -an 2>/dev/null | head -100; fi
+
+section hardware; if command -v lscpu >/dev/null 2>&1; then lscpu 2>/dev/null | head -55; else sysctl hw.model hw.ncpu hw.physmem hw.disknames 2>/dev/null; fi
+section processes; ps -axo pid,comm,%cpu,%mem 2>/dev/null | head -300
+section versions
+for program in nginx apache2 httpd postgres psql mysql mariadb docker podman redis-server php node python3 go caddy sshd; do
+  if command -v "$program" >/dev/null 2>&1; then
+    case "$program" in
+      nginx|sshd) version=$("$program" -V 2>&1 | head -1);;
+      redis-server) version=$("$program" -v 2>&1 | head -1);;
+      go) version=$("$program" version 2>&1 | head -1);;
+      caddy) version=$("$program" version 2>&1 | head -1);;
+      *) version=$("$program" --version 2>&1 | head -1);;
+    esac
+    printf '%s: %s\n' "$program" "$version"
+  fi
+done
+section packages
+if command -v dpkg-query >/dev/null 2>&1; then
+  dpkg-query -W -f='\u0024{Package} \u0024{Version}\n' 2>/dev/null | head -2000
+elif command -v pkg_info >/dev/null 2>&1; then
+  pkg_info -q 2>/dev/null | head -2000
+elif command -v rpm >/dev/null 2>&1; then
+  rpm -qa 2>/dev/null | head -2000
+fi
+section metrics
+if test -r /proc/loadavg; then awk '{print "load1="$1}' /proc/loadavg; else sysctl -n vm.loadavg 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+[.][0-9]+$/) {print "load1="$i; exit}}'; fi
+if test -r /proc/meminfo; then awk '/^MemTotal:/ {print "mem_total_kb="$2} /^MemAvailable:/ {print "mem_available_kb="$2}' /proc/meminfo; else
+  sysctl -n hw.physmem 2>/dev/null | awk '{print "mem_total_kb="int($1/1024)}'
+fi
+df -Pk / 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5);print "root_disk_pct="$5}'
+
 `
 func probeHost(ctx context.Context, h Host, opts SSHOptions) Probe {
 	if h.MainIP == "" {

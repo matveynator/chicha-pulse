@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -46,6 +47,16 @@ func (srv *Server) handleFleetSettings(w http.ResponseWriter, r *http.Request) {
 	if !srv.permissionsFromRequest(r).CanAdmin {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
+	}
+	// Never receive credentials over plaintext connections from remote clients.
+	// A reverse proxy on the same machine may safely forward HTTPS locally.
+	if r.TLS == nil {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		ip := net.ParseIP(host)
+		if err != nil || ip == nil || !ip.IsLoopback() {
+			http.Error(w, "HTTPS is required for remote settings access", http.StatusForbidden)
+			return
+		}
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "no-referrer")

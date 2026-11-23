@@ -15,6 +15,13 @@ type Sample struct {
 	Load1            float64   `json:"load1"`
 	MemoryUsedPct    float64   `json:"memory_used_pct"`
 	RootDiskUsedPct  float64   `json:"root_disk_used_pct"`
+	CPUUsedPct       float64   `json:"cpu_used_pct"`
+	NetworkRXBPS     float64   `json:"network_rx_bps"`
+	NetworkTXBPS     float64   `json:"network_tx_bps"`
+	CPUTotalTicks    float64   `json:"-"`
+	CPUIdleTicks     float64   `json:"-"`
+	NetworkRXBytes   float64   `json:"-"`
+	NetworkTXBytes   float64   `json:"-"`
 }
 
 type HostState struct {
@@ -103,7 +110,20 @@ func StartMonitor(ctx context.Context, cfg Config, ssh SSHOptions, interval time
 					if next.Status == "online" {
 						next.LastOnline = next.LastProbe
 						if sample, ok := parseSample(next.SSH.Sections["metrics"], next.LastProbe); ok {
-							next.History = append(next.History, sample)
+							if len(next.History) > 0 {
+							prev := next.History[len(next.History)-1]
+							totalDelta := sample.CPUTotalTicks - prev.CPUTotalTicks
+							idleDelta := sample.CPUIdleTicks - prev.CPUIdleTicks
+							if totalDelta > 0 && idleDelta >= 0 && idleDelta <= totalDelta {
+								sample.CPUUsedPct = (1 - idleDelta / totalDelta) * 100
+							}
+							seconds := sample.At.Sub(prev.At).Seconds()
+							if seconds > 0 {
+								if delta := sample.NetworkRXBytes - prev.NetworkRXBytes; delta >= 0 { sample.NetworkRXBPS = delta / seconds }
+								if delta := sample.NetworkTXBytes - prev.NetworkTXBytes; delta >= 0 { sample.NetworkTXBPS = delta / seconds }
+							}
+						}
+						next.History = append(next.History, sample)
 						}
 					}
 					if len(next.History) > 120 {
@@ -178,6 +198,14 @@ func parseSample(raw string, at time.Time) (Sample, bool) {
 			memAvailable = value
 		case "root_disk_pct":
 			s.RootDiskUsedPct = value
+		case "cpu_total_ticks":
+			s.CPUTotalTicks = value
+		case "cpu_idle_ticks":
+			s.CPUIdleTicks = value
+		case "net_rx_bytes":
+			s.NetworkRXBytes = value
+		case "net_tx_bytes":
+			s.NetworkTXBytes = value
 		}
 	}
 	if memTotal > 0 {

@@ -121,7 +121,7 @@ for program in nginx apache2 httpd postgres psql mysql mariadb docker podman red
 done
 section packages
 if command -v dpkg-query >/dev/null 2>&1; then
-  dpkg-query -W -f='\u0024{Package} \u0024{Version}\n' 2>/dev/null | head -2000
+  dpkg-query -W -f='${Package} ${Version}\n' 2>/dev/null | head -2000
 elif command -v pkg_info >/dev/null 2>&1; then
   pkg_info -q 2>/dev/null | head -2000
 elif command -v rpm >/dev/null 2>&1; then

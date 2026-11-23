@@ -109,12 +109,12 @@ func (srv *Server) handleFleetMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "chicha_fleet_ssh_up%s %d\n", labels, up)
 		if len(item.History) == 0 { continue }
 		s := item.History[len(item.History)-1]
-		fmt.Fprintf(w, "chicha_fleet_load1%s %.3f\n", labels, s.Load1)
-		fmt.Fprintf(w, "chicha_fleet_memory_used_percent%s %.3f\n", labels, s.MemoryUsedPct)
-		fmt.Fprintf(w, "chicha_fleet_root_disk_used_percent%s %.3f\n", labels, s.RootDiskUsedPct)
-		fmt.Fprintf(w, "chicha_fleet_cpu_used_percent%s %.3f\n", labels, s.CPUUsedPct)
-		fmt.Fprintf(w, "chicha_fleet_network_rx_bytes_per_second%s %.3f\n", labels, s.NetworkRXBPS)
-		fmt.Fprintf(w, "chicha_fleet_network_tx_bytes_per_second%s %.3f\n", labels, s.NetworkTXBPS)
+		if s.HasLoad { fmt.Fprintf(w, "chicha_fleet_load1%s %.3f\n", labels, s.Load1) }
+		if s.HasMemory { fmt.Fprintf(w, "chicha_fleet_memory_used_percent%s %.3f\n", labels, s.MemoryUsedPct) }
+		if s.HasDisk { fmt.Fprintf(w, "chicha_fleet_root_disk_used_percent%s %.3f\n", labels, s.RootDiskUsedPct) }
+		if s.HasCPU { fmt.Fprintf(w, "chicha_fleet_cpu_used_percent%s %.3f\n", labels, s.CPUUsedPct) }
+		if s.HasNetwork { fmt.Fprintf(w, "chicha_fleet_network_rx_bytes_per_second%s %.3f\n", labels, s.NetworkRXBPS)
+			fmt.Fprintf(w, "chicha_fleet_network_tx_bytes_per_second%s %.3f\n", labels, s.NetworkTXBPS) }
 	}
 }
 func escapePromLabel(s string) string { return strings.ReplaceAll(strings.ReplaceAll(s, "\n", " "), "\r", " ") }
@@ -242,8 +242,9 @@ button{background:#233449;color:#e6edf3;border:1px solid #3d5269;padding:8px 12p
     ctx.clearRect(0,0,width,height);
     ctx.strokeStyle="#324356";ctx.lineWidth=1;
     for(var g=0;g<=3;g++){var gy=pad+(height-2*pad)*g/3;ctx.beginPath();ctx.moveTo(pad,gy);ctx.lineTo(width-pad,gy);ctx.stroke();}
-    var vals = history.map(function(s){return Number(s[field])||0;});
-    if(!vals.length)return;
+    var flag=field==="load1"?"has_load":field==="memory_used_pct"?"has_memory":field==="root_disk_used_pct"?"has_disk":field==="cpu_used_pct"?"has_cpu":"has_network";
+    var vals = history.filter(function(s){return !!s[flag];}).map(function(s){return Number(s[field])||0;});
+    if(!vals.length){ctx.fillStyle="#8393a4";ctx.font="12px sans-serif";ctx.fillText("Not available",12,height/2);return;}
     var max = ceiling || Math.max(1,Math.max.apply(null,vals)*1.15);
     ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();
     vals.forEach(function(value,i){ var x=pad+(width-2*pad)*(vals.length===1?1:i/(vals.length-1)); var y=height-pad-Math.min(1,value/max)*(height-2*pad);if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y); });ctx.stroke();
@@ -263,10 +264,10 @@ button{background:#233449;color:#e6edf3;border:1px solid #3d5269;padding:8px 12p
     if(history.length){
       var latest=history[history.length-1];
       text("#latest-load",Number(latest.load1||0).toFixed(2));
-      text("#latest-mem",Number(latest.memory_used_pct||0).toFixed(1)+"%");
-      text("#latest-disk",Number(latest.root_disk_used_pct||0).toFixed(1)+"%");
-      text("#latest-cpu",history.length<2?"—":Number(latest.cpu_used_pct||0).toFixed(1)+"%");
-      text("#latest-network",history.length<2?"—":(Number(latest.network_rx_bps||0)/1024).toFixed(1)+" / "+(Number(latest.network_tx_bps||0)/1024).toFixed(1)+" KiB/s");
+      text("#latest-mem",latest.has_memory?Number(latest.memory_used_pct||0).toFixed(1)+"%":"—");
+      text("#latest-disk",latest.has_disk?Number(latest.root_disk_used_pct||0).toFixed(1)+"%":"—");
+      text("#latest-cpu",latest.has_cpu?Number(latest.cpu_used_pct||0).toFixed(1)+"%":"—");
+      text("#latest-network",latest.has_network?(Number(latest.network_rx_bps||0)/1024).toFixed(1)+" / "+(Number(latest.network_tx_bps||0)/1024).toFixed(1)+" KiB/s":"—");
     }
     document.querySelectorAll("canvas[data-metric]").forEach(function(canvas) {
       var metric=canvas.getAttribute("data-metric");

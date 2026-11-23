@@ -101,6 +101,7 @@ func (srv *Server) handleFleetMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	fmt.Fprintln(w, "# HELP chicha_fleet_ssh_up 1 if the last SSH probe completed successfully.")
 	fmt.Fprintln(w, "# TYPE chicha_fleet_ssh_up gauge")
+	for _, name := range []string{"chicha_fleet_load1","chicha_fleet_memory_used_percent","chicha_fleet_root_disk_used_percent","chicha_fleet_cpu_used_percent","chicha_fleet_network_rx_bytes_per_second","chicha_fleet_network_tx_bytes_per_second"} { fmt.Fprintf(w, "# TYPE %s gauge\n", name) }
 	for _, item := range snap.Hosts {
 		labels := fmt.Sprintf("{provider=%q,server_id=%q,server_name=%q}", item.Host.Provider, item.Host.ID, escapePromLabel(item.Host.Name))
 		up := 0
@@ -111,6 +112,9 @@ func (srv *Server) handleFleetMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "chicha_fleet_load1%s %.3f\n", labels, s.Load1)
 		fmt.Fprintf(w, "chicha_fleet_memory_used_percent%s %.3f\n", labels, s.MemoryUsedPct)
 		fmt.Fprintf(w, "chicha_fleet_root_disk_used_percent%s %.3f\n", labels, s.RootDiskUsedPct)
+		fmt.Fprintf(w, "chicha_fleet_cpu_used_percent%s %.3f\n", labels, s.CPUUsedPct)
+		fmt.Fprintf(w, "chicha_fleet_network_rx_bytes_per_second%s %.3f\n", labels, s.NetworkRXBPS)
+		fmt.Fprintf(w, "chicha_fleet_network_tx_bytes_per_second%s %.3f\n", labels, s.NetworkTXBPS)
 	}
 }
 func escapePromLabel(s string) string { return strings.ReplaceAll(strings.ReplaceAll(s, "\n", " "), "\r", " ") }
@@ -198,13 +202,18 @@ button{background:#233449;color:#e6edf3;border:1px solid #3d5269;padding:8px 12p
  <div class="metric"><label>Hostname</label><strong style="font-size:15px" data-section-metric="hostname">{{index .State.SSH.Sections "hostname"}}</strong></div>
  <div class="metric"><label>Load (1 min)</label><strong id="latest-load">—</strong></div>
  <div class="metric"><label>RAM used</label><strong id="latest-mem">—</strong></div>
+ <div class="metric"><label>CPU used (Linux)</label><strong id="latest-cpu">—</strong></div>
  <div class="metric"><label>Root disk used</label><strong id="latest-disk">—</strong></div>
+ <div class="metric"><label>Network in / out</label><strong style="font-size:14px" id="latest-network">—</strong></div>
  <div class="metric"><label>Uptime</label><strong style="font-size:13px" data-section-metric="uptime">{{index .State.SSH.Sections "uptime"}}</strong></div>
 </div>
 <div class="chartgrid">
  <div class="chart"><label>Load average (1 min)</label><canvas width="320" height="116" data-metric="load1"></canvas></div>
+ <div class="chart"><label>CPU utilization (Linux)</label><canvas width="320" height="116" data-metric="cpu_used_pct"></canvas></div>
  <div class="chart"><label>Memory utilization</label><canvas width="320" height="116" data-metric="memory_used_pct"></canvas></div>
  <div class="chart"><label>Root filesystem utilization</label><canvas width="320" height="116" data-metric="root_disk_used_pct"></canvas></div>
+ <div class="chart"><label>Network receive (B/s)</label><canvas width="320" height="116" data-metric="network_rx_bps"></canvas></div>
+ <div class="chart"><label>Network transmit (B/s)</label><canvas width="320" height="116" data-metric="network_tx_bps"></canvas></div>
 </div>
 <details class="section" open><summary>Hardware · CPU · memory</summary><pre data-section="hardware">{{index .State.SSH.Sections "hardware"}}</pre><pre data-section="memory">{{index .State.SSH.Sections "memory"}}</pre></details>
 <details class="section" open><summary>Disks · filesystem · RAID · SMART</summary><pre data-section="disks">{{index .State.SSH.Sections "disks"}}</pre><pre data-section="filesystem">{{index .State.SSH.Sections "filesystem"}}</pre><pre data-section="raid">{{index .State.SSH.Sections "raid"}}</pre><pre data-section="smart">{{index .State.SSH.Sections "smart"}}</pre></details>
@@ -256,10 +265,12 @@ button{background:#233449;color:#e6edf3;border:1px solid #3d5269;padding:8px 12p
       text("#latest-load",Number(latest.load1||0).toFixed(2));
       text("#latest-mem",Number(latest.memory_used_pct||0).toFixed(1)+"%");
       text("#latest-disk",Number(latest.root_disk_used_pct||0).toFixed(1)+"%");
+      text("#latest-cpu",history.length<2?"—":Number(latest.cpu_used_pct||0).toFixed(1)+"%");
+      text("#latest-network",history.length<2?"—":(Number(latest.network_rx_bps||0)/1024).toFixed(1)+" / "+(Number(latest.network_tx_bps||0)/1024).toFixed(1)+" KiB/s");
     }
     document.querySelectorAll("canvas[data-metric]").forEach(function(canvas) {
       var metric=canvas.getAttribute("data-metric");
-      plot(canvas,history,metric,metric==="load1"?"#5da9fa":metric==="memory_used_pct"?"#43d9a3":"#f2bd69",metric==="load1"?0:100);
+      plot(canvas,history,metric,metric==="load1"?"#5da9fa":metric==="memory_used_pct"?"#43d9a3":metric==="cpu_used_pct"?"#ac8ced":metric.indexOf("network_")===0?"#f5ad6b":"#f2bd69",metric==="load1"||metric.indexOf("network_")===0?0:100);
     });
   }
   function refresh() {

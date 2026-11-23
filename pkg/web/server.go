@@ -1191,6 +1191,7 @@ const indexTemplate = `<!doctype html>
 <body>
   <h1>{{.Title}}</h1>
   <div class="card"><a href="/fleet">Fleet dashboard — servers, SSH status, hardware and processes</a></div>
+  {{if .CanAdmin}}<div class="card"><a href="/fleet/settings">Configure Hetzner, Selectel and SSH connections</a></div>{{end}}
 
   {{if .CanViewMonitoring}}
     <div class="card">

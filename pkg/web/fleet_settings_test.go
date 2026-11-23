@@ -86,3 +86,20 @@ func TestFleetSettingsRequireHTTPSExceptLoopback(t *testing.T) {
 		})
 	}
 }
+
+// Saving tokens requires both an administrator session and an unguessable
+// form token; this is important with the existing HTTP Basic Auth sessions.
+func TestFleetSettingsRejectsMissingCSRF(t *testing.T) {
+	t.Setenv("CHICHA_FLEET_SETTINGS_FILE", filepath.Join(t.TempDir(), "fleet.enc"))
+	srv := &Server{fleetCSRF:"unpredictable-form-token"}
+	body := url.Values{"action":{"save"}, "ssh_user":{"root"}, "ssh_port":{"22"}, "poll_seconds":{"90"}}.Encode()
+	req := httptest.NewRequest("POST", "http://localhost/fleet/settings", strings.NewReader(body))
+	req.Header.Set("Content-Type","application/x-www-form-urlencoded")
+	req.RemoteAddr = "127.0.0.1:54321"
+	req = req.WithContext(context.WithValue(req.Context(),userContextKey,auth.User{Roles:[]auth.Role{auth.RoleAdmin}}))
+	w := httptest.NewRecorder()
+	srv.handleFleetSettings(w,req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("missing CSRF token was accepted: %d",w.Code)
+	}
+}

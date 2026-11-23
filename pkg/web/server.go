@@ -26,6 +26,7 @@ import (
 // ---- Server ----
 
 type Server struct {
+	fleetCSRF      string
 	fleet          *fleet.Monitor
 	store          *store.Store
 	authManager    *auth.Manager
@@ -61,7 +62,10 @@ func NewServer(st *store.Store, authManager *auth.Manager, pageTitle string, all
 		"statusBadge": statusBadge,
 		"safeID":      safeID,
 	}).Parse(hostsTemplate))
+	csrf, err := newFleetCSRF()
+	if err != nil { return nil, err }
 	return &Server{
+		fleetCSRF:      csrf,
 		store:          st,
 		authManager:    authManager,
 		template:       page,
@@ -77,6 +81,7 @@ func (srv *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleIndex)
 	mux.HandleFunc("/fleet", srv.handleFleetPage)
+	mux.HandleFunc("/fleet/settings", srv.handleFleetSettings)
 	mux.HandleFunc("/fleet/data", srv.handleFleetData)
 	mux.HandleFunc("/fleet/metrics", srv.handleFleetMetrics)
 	mux.HandleFunc("/events/stats", srv.handleStatsEvents)

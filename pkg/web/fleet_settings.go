@@ -261,7 +261,7 @@ button:hover{filter:brightness(1.13)}
 <small>Если ключ не указан, будет использован SSH-agent или стандартная конфигурация OpenSSH на сервере мониторинга.</small>
 </section>
 <div class="bar">
-<small>Токены и пароли сохраняются в зашифрованном файле с доступом только для процесса мониторинга. Не открывайте эту страницу по незащищённому HTTP.</small>
+<small>Токены и пароли шифруются; доступ к файлам имеют пользователь службы и администратор системы. Не открывайте эту страницу по незащищённому HTTP.</small>
 <div><button class="secondary" type="submit" name="action" value="test">Проверить API и сохранить</button> <button type="submit" name="action" value="save">Сохранить</button></div>
 </div>
 </form>
